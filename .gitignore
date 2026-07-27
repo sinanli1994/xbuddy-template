@@ -140,8 +140,10 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .python-version
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -225,5 +227,7 @@ frontend/.env.local
 frontend/.env*.local
 frontend/tsconfig.tsbuildinfo
 
-# Lock file (regenerate with uv sync)
-uv.lock
+# Local SQLite database
+*.db
+*.db-shm
+*.db-wal
