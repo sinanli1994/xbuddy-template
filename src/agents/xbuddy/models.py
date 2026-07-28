@@ -1,18 +1,15 @@
-"""Pydantic models for your XBuddy Agent.
+"""Pydantic models for the JobBuddy Agent.
 
-Study FounderBuddy's models.py to understand how these work:
-https://github.com/Victoria824/FounderBuddy/blob/main/src/agents/founder_buddy/models.py
+Reference: https://github.com/Victoria824/FounderBuddy/blob/main/src/agents/founder_buddy/models.py
 """
 
-import uuid
-from typing import Any
+from typing import Any, NotRequired
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field, field_validator
 
-from .enums import RouterDirective, SectionID, SectionStatus
-from .sections.base_prompt import SectionTemplate, ValidationRule
+from .enums import SectionID, SectionStatus
 
 
 class SectionContent(BaseModel):
@@ -39,16 +36,42 @@ class ContextPacket(BaseModel):
 
 
 class XBuddyData(BaseModel):
-    """Domain-specific data collected from the user.
+    """Job-search data collected across the five JobBuddy sections.
 
-    TODO: Replace these fields with data relevant to your domain.
-    For example, StudentBuddy might have:
-      learning_goals: list[str]
-      current_level: str
-      available_hours_per_week: int
-      preferred_subjects: list[str]
+    Intentionally flat and minimal: the LLM extraction that populates these
+    fields arrives in a later PR, so the schema stays easy to widen later.
+
+    Every field is defaulted, so `XBuddyData()` is valid and partial
+    mid-conversation data never fails validation. Combined with Pydantic's
+    default `extra="ignore"`, this keeps the model compatible with older
+    checkpoints in both directions.
     """
-    pass
+
+    # --- Career Goal ---
+    target_roles: list[str] = Field(default_factory=list)
+    career_goal_summary: str | None = None
+    target_timeline: str | None = None  # free text: "3 months", "ASAP"
+
+    # --- Background ---
+    current_role: str | None = None
+    years_experience: int | None = None
+    highest_education: str | None = None
+    work_history: list[str] = Field(default_factory=list)
+
+    # --- Job Preferences ---
+    preferred_locations: list[str] = Field(default_factory=list)
+    preferred_work_modes: list[str] = Field(default_factory=list)  # "remote", "hybrid", "onsite"
+    target_industries: list[str] = Field(default_factory=list)
+    employment_types: list[str] = Field(default_factory=list)  # "full-time", "contract"
+    salary_expectation: str | None = None  # free text, avoids currency modeling
+
+    # --- Skill Assessment ---
+    strengths: list[str] = Field(default_factory=list)
+    current_skills: list[str] = Field(default_factory=list)
+    skill_gaps: list[str] = Field(default_factory=list)
+
+    # --- Action Plan ---
+    action_items: list[str] = Field(default_factory=list)
 
 
 class ChatAgentDecision(BaseModel):
@@ -94,37 +117,50 @@ class ChatAgentOutput(BaseModel):
 
 
 class XBuddyState(MessagesState):
-    """State for your XBuddy agent.
+    """State for the JobBuddy agent.
 
     Extends MessagesState (which provides `messages: list[BaseMessage]`).
-    Study FounderBuddyState to understand each field's role in the graph.
+
+    IMPORTANT: MessagesState is a TypedDict, not a Pydantic BaseModel, so
+    class-level defaults (including `Field(default_factory=...)`) are inert —
+    they are never applied at runtime. `initialize_node` is therefore the
+    single source of state defaults; see nodes/initialize.py and
+    state_factory.py.
+
+    Every key added here is `NotRequired`, because between START and the end
+    of `initialize` the state legitimately contains almost nothing, and nodes
+    return partial update dicts rather than whole states.
+
+    `messages` carries the `add_messages` reducer, so it must never be
+    returned by a node that did not intend to append.
     """
+
     # User and conversation identification
-    user_id: int = 1
-    thread_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: NotRequired[int]
+    thread_id: NotRequired[str]
 
     # Navigation and progress
-    current_section: SectionID = SectionID.SECTION_1
-    context_packet: ContextPacket | None = None
-    section_states: dict[str, SectionState] = Field(default_factory=dict)
-    router_directive: str = RouterDirective.NEXT
-    finished: bool = False
+    current_section: NotRequired[SectionID]
+    context_packet: NotRequired[ContextPacket | None]
+    section_states: NotRequired[dict[str, SectionState]]
+    router_directive: NotRequired[str]
+    finished: NotRequired[bool]
 
-    # Domain-specific data — TODO: customize XBuddyData above
-    user_data: XBuddyData = Field(default_factory=XBuddyData)
+    # Domain-specific data
+    user_data: NotRequired[XBuddyData]
 
     # Memory management
-    short_memory: list[BaseMessage] = Field(default_factory=list)
+    short_memory: NotRequired[list[BaseMessage]]
 
     # Agent output
-    agent_output: ChatAgentOutput | None = None
-    awaiting_user_input: bool = False
-    awaiting_satisfaction_feedback: bool = False
+    agent_output: NotRequired[ChatAgentOutput | None]
+    awaiting_user_input: NotRequired[bool]
+    awaiting_satisfaction_feedback: NotRequired[bool]
 
     # Error tracking
-    error_count: int = 0
-    last_error: str | None = None
+    error_count: NotRequired[int]
+    last_error: NotRequired[str | None]
 
-    # Final output — TODO: rename to match your domain
-    final_output: str | None = None
-    should_generate_final_output: bool = False
+    # Final output — the generated job search strategy
+    final_output: NotRequired[str | None]
+    should_generate_final_output: NotRequired[bool]

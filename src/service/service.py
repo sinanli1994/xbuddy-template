@@ -27,7 +27,7 @@ from langsmith import Client as LangsmithClient
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
-# TODO: import your agent initialization
+from agents.xbuddy import initialize_xbuddy_state
 # TODO: import your section templates
 from core import settings
 from core.settings import DatabaseType

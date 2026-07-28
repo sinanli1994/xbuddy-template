@@ -3,20 +3,20 @@
 Reference: https://github.com/Victoria824/FounderBuddy/blob/main/src/agents/founder_buddy/sections/mission/__init__.py
 
 TODO: Define your SectionTemplate here with:
-  - section_id: SectionID.SECTION_5
+  - section_id: SectionID.ACTION_PLAN
   - name: human-readable name
   - description: what this section covers
   - system_prompt_template: the prompt that guides the LLM in this section
   - validation_rules: what fields are required
   - required_fields: list of field names
-  - next_section: SectionID.SECTION_6 (or None for the last section)
+  - next_section: None (this is the last section)
 """
 
 from ...enums import SectionID
 from ..base_prompt import SectionTemplate
 
 SECTION_5_TEMPLATE = SectionTemplate(
-    section_id=SectionID.SECTION_5,
+    section_id=SectionID.ACTION_PLAN,
     name="Section 5",
     description="TODO: describe what this section covers",
     system_prompt_template="""
