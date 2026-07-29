@@ -18,18 +18,14 @@ class RouterDirective(str, Enum):
 
 
 class SectionID(str, Enum):
-    """Your agent's section identifiers.
+    """JobBuddy's section identifiers.
 
-    TODO: Rename these to match your domain.
-    For example, if you're building StudentBuddy:
-      GOALS = "goals"
-      SCHEDULE = "schedule"
-      RESOURCES = "resources"
-      STUDY_PLAN = "study_plan"
-      REVIEW = "review"
+    Declaration order is load-bearing: `get_next_section` and
+    `get_next_unfinished_section` in prompts.py walk `list(SectionID)`,
+    so these must stay in the order the user progresses through them.
     """
-    SECTION_1 = "section_1"
-    SECTION_2 = "section_2"
-    SECTION_3 = "section_3"
-    SECTION_4 = "section_4"
-    SECTION_5 = "section_5"
+    CAREER_GOAL = "career_goal"
+    BACKGROUND = "background"
+    JOB_PREFERENCES = "job_preferences"
+    SKILL_ASSESSMENT = "skill_assessment"
+    ACTION_PLAN = "action_plan"
