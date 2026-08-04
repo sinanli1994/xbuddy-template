@@ -1,0 +1,21 @@
+case_id,variant,answerability,progress,section_discipline,non_leading_guidance,conciseness,total_score,notes
+field_not_role,a_strict,4,5,5,5,5,24,"Clear, focused, open-ended, and concise. Slightly less scaffolding for a vague user."
+field_not_role,b_anchored,5,5,5,3,3,21,"Concrete examples improve answerability, but make the reply longer and somewhat leading."
+no_timeline,a_strict,4,5,5,5,5,24,"Directly asks for the missing timeline, stays focused, and is concise. Slightly less scaffolding for users who are unsure how specific to be."
+no_timeline,b_anchored,5,5,5,4,4,23,"Timeline examples make the question easier to answer, with only mild anchoring and a small conciseness cost."
+asks_back,a_strict,5,4,4,5,4,22,"Supportive and easy to answer. Uses the current QA role to uncover preferences, though it advances the career-goal fields indirectly and slightly overlaps with Background."
+asks_back,b_anchored,5,4,4,3,3,19,"Examples help a user who asks for direction, but the response is longer and the examples may steer the answer toward predefined motivations."
+vague_opener,a_strict,5,5,5,5,5,25,"Direct, open-ended, and immediately targets the missing role field with one clear question."
+vague_opener,b_anchored,5,5,5,2,2,19,"Highly answerable, but asks multiple questions and anchors the user to several unrelated example roles, making it noticeably more leading and verbose."
+over_specific,a_strict,5,5,5,5,5,25,"Accurately summarizes the already-known role and timeline, then asks one open question that advances the career-goal summary without adding unnecessary examples."
+over_specific,b_anchored,5,5,5,2,2,19,"The follow-up is answerable and relevant, but the long list of motives and examples heavily anchors the user and adds substantial unnecessary length."
+dont_know,a_strict,5,4,4,4,4,21,"Empathetic and practical. Uses likes and dislikes to uncover direction, though the compound question slightly overlaps with Background and asks for two kinds of information at once."
+dont_know,b_anchored,5,4,4,3,3,19,"Concrete examples make it easier to respond, but the reply contains multiple prompts and steers the user toward a specific interpretation of past-work preferences."
+volunteers_later_section,a_strict,5,5,5,3,4,22,"Correctly acknowledges and defers preferences and skills, then returns to Career Goal. The motive examples are somewhat leading, but the response remains focused and reasonably concise."
+volunteers_later_section,b_anchored,5,5,5,3,4,22,Also handles out-of-section information correctly and asks one relevant Career Goal question. Similar strengths and the same mild anchoring from the motive examples.
+unrealistic_timeline,a_strict,5,5,5,4,5,24,Directly challenges the unrealistic timeline while staying respectful. Offers a clear choice between adjusting the timeline and targeting an intermediate role without overexplaining.
+unrealistic_timeline,b_anchored,5,5,5,3,3,21,"Helpful and realistic, but longer and more prescriptive. The examples steer the user toward specific intermediate roles and add unnecessary detail."
+career_changer,a_strict,5,5,5,5,5,25,"Open-ended, concise, and directly asks the user to imagine the day-to-day work they want next without steering them toward preset occupations."
+career_changer,b_anchored,5,5,5,2,3,20,"The examples make the question easy to answer, but strongly anchor the user to project management, data analysis, or graphic design and add unnecessary length."
+competing_roles,a_strict,5,5,5,5,5,25,"Acknowledges both target roles and asks one open question about the desired career change, helping reveal the deciding criterion without imposing options."
+competing_roles,b_anchored,5,5,5,3,4,22,"Relevant and answerable, but the leadership and salary examples may bias the user's comparison and make the response slightly less concise."

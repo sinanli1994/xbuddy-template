@@ -2,20 +2,38 @@
 
 Reference: https://github.com/Victoria824/FounderBuddy/blob/main/src/agents/founder_buddy/prompts.py
 
-TODO: Implement:
-  - get_section_template(section_id) -> SectionTemplate
-  - get_next_section(current_section) -> SectionID | None
-  - get_next_unfinished_section(state) -> SectionID | None
+`SECTION_TEMPLATES` lives in this module (rather than in sections/) because
+service/utils.py:_get_section_name dynamically imports `agents.<name>.prompts`
+and reads a module-level `SECTION_TEMPLATES` dict keyed by section-id string.
+Matching that convention keeps JobBuddy compatible with the service layer.
 """
 
 from .enums import SectionID
+from .sections import ALL_SECTION_TEMPLATES
 from .sections.base_prompt import SectionTemplate
 
+# Keyed by SectionID *value* ("career_goal"), matching section_states keys and
+# the service layer's lookups.
+SECTION_TEMPLATES: dict[str, SectionTemplate] = {
+    template.section_id.value: template for template in ALL_SECTION_TEMPLATES
+}
 
-def get_section_template(section_id: SectionID) -> SectionTemplate:
-    """Return the template for a given section."""
-    # TODO: Map each SectionID to its SectionTemplate
-    raise NotImplementedError("Implement section template mapping")
+
+def get_section_template(section_id: SectionID | str) -> SectionTemplate:
+    """Return the template for a given section.
+
+    Accepts a SectionID or its string value. Raises ValueError for anything
+    that is not one of the five JobBuddy sections.
+    """
+    try:
+        key = SectionID(section_id).value
+    except ValueError as exc:
+        raise ValueError(f"Unknown section_id: {section_id!r}") from exc
+
+    try:
+        return SECTION_TEMPLATES[key]
+    except KeyError as exc:  # pragma: no cover - guards a missing template file
+        raise ValueError(f"No section template registered for {key!r}") from exc
 
 
 def get_next_section(current: SectionID) -> SectionID | None:
