@@ -88,18 +88,13 @@ def langchain_to_chat_message(message: BaseMessage) -> ChatMessage:
                 agent_name = message.additional_kwargs.get("agent_name")
 
                 if section_id_str and agent_name:
-                    # Import mapping utilities
-                    # Removed: DentApp integration
-
-                    # Map section string ID to database integer ID
-                    section_id_int = SECTION_ID_MAPPING.get(section_id_str)
-
-                    # Get section name using helper function
+                    # section_id stays a string: section_states.section_id is TEXT
+                    # and the frontend already expects a string for this agent.
                     section_name = _get_section_name(agent_name, section_id_str)
 
                     # Add to custom_data (saved_section is always False for human messages)
                     human_message.custom_data.update({
-                        "section_id": section_id_int,
+                        "section_id": section_id_str,
                         "section_name": section_name,
                         "agent_name": agent_name,
                         "saved_section": False,
@@ -122,13 +117,8 @@ def langchain_to_chat_message(message: BaseMessage) -> ChatMessage:
                 agent_name = message.additional_kwargs.get("agent_name")
 
                 if section_id_str and agent_name:
-                    # Import mapping utilities
-                    # Removed: DentApp integration
-
-                    # Map section string ID to database integer ID
-                    section_id_int = SECTION_ID_MAPPING.get(section_id_str)
-
-                    # Get section name using helper function
+                    # section_id stays a string: section_states.section_id is TEXT
+                    # and the frontend already expects a string for this agent.
                     section_name = _get_section_name(agent_name, section_id_str)
 
                     # Check if this message triggered a save operation
@@ -137,7 +127,7 @@ def langchain_to_chat_message(message: BaseMessage) -> ChatMessage:
 
                     # Add to custom_data
                     ai_message.custom_data.update({
-                        "section_id": section_id_int,
+                        "section_id": section_id_str,
                         "section_name": section_name,
                         "agent_name": agent_name,
                         "saved_section": saved_section

@@ -28,7 +28,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
 from agents.xbuddy import initialize_xbuddy_state
-# TODO: import your section templates
+from agents.xbuddy.prompts import SECTION_TEMPLATES
 from core import settings
 from core.settings import DatabaseType
 # Removed: # DentApp (removed) integration
@@ -127,6 +127,20 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             logger.error(f"FRONTEND_ERROR: {str(e)}")
             logger.error(f"FRONTEND_ERROR: Processing time: {process_time:.3f}s")
             raise
+
+
+# Display-only position badge for the progress sidebar, which renders it as
+# "#1".."#5". NOT a database id: section_states.section_id is TEXT and stores the
+# SectionID string value, and save_section_state() takes that string. Never
+# persist this and never import it outside this module. The payload key is called
+# "database_id" only because the existing frontend contract already calls it that.
+_SECTION_DISPLAY_POSITION: dict[str, int] = {
+    "career_goal": 1,
+    "background": 2,
+    "job_preferences": 3,
+    "skill_assessment": 4,
+    "action_plan": 5,
+}
 
 
 def mask_sensitive_fields(data: dict | list | Any) -> dict | list | Any:
@@ -469,14 +483,14 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> Invoke
             section_state = state.values.get("section_states", {}).get(current_section_id)
             # Choose the right section templates based on agent_id
             if agent_id == "xbuddy":
-                section_templates = FOUNDER_BUDDY_TEMPLATES
+                section_templates = SECTION_TEMPLATES
             else:
                 raise ValueError(f"Unknown agent: {agent_id}")
-            
+
             section_template = section_templates.get(current_section_id)
 
             section_data = {
-                "database_id": SECTION_ID_MAPPING.get(current_section_id),
+                "database_id": _SECTION_DISPLAY_POSITION.get(current_section_id),
                 "name": section_template.name if section_template else "Unknown Section",
                 "status": section_state.status.value if section_state else "pending",
             }
@@ -783,14 +797,14 @@ async def message_generator(
                 elif agent_id == "concept-pitch":
                     section_templates = CONCEPT_PITCH_TEMPLATES
                 elif agent_id == "xbuddy":
-                    section_templates = FOUNDER_BUDDY_TEMPLATES
+                    section_templates = SECTION_TEMPLATES
                 else:  # default to value_canvas
                     section_templates = VALUE_CANVAS_TEMPLATES
-                
+
                 section_template = section_templates.get(current_section_id)
 
                 section_data = {
-                    "database_id": SECTION_ID_MAPPING.get(current_section_id),
+                    "database_id": _SECTION_DISPLAY_POSITION.get(current_section_id),
                     "name": section_template.name if section_template else "Unknown Section",
                     "status": section_state.status.value if section_state else "pending",
                 }
