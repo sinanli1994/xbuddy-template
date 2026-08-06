@@ -81,43 +81,108 @@ async def test_model_exception_falls_back_and_counts(decision_chain, make_state)
 
 
 @pytest.mark.asyncio
-async def test_every_error_path_records_and_counts_together(
-    decision_chain, make_state, make_decision
+@pytest.mark.parametrize(
+    "scenario",
+    ["missing_packet", "model_raises", "unparseable_output"],
+)
+async def test_every_reachable_error_path_records_and_counts_together(
+    decision_chain, make_state, make_decision, scenario
 ):
-    """last_error and error_count must move as a pair.
+    """last_error and error_count must move as a pair on every failure path.
 
-    They used to sit behind separate flags, so three of the four failure paths
-    recorded an error without ever counting it. Parametrising over all four
-    fails if they are ever allowed to drift apart again.
+    They used to sit behind separate flags, so three of the four `error=True`
+    call sites recorded an error without ever counting it.
+
+    These are the three failure paths a real turn can actually take. The fourth
+    `error=True` call site — a directive rejected by the ChatAgentDecision
+    validator — is unreachable by construction and is covered by
+    test_composed_directive_is_always_valid instead of being faked here.
     """
-    scenarios: list[tuple[str, dict]] = []
+    state_kwargs: dict = {}
+    decision_chain.raises = None
+    decision_chain.parsing_error = None
+    decision_chain.decision = make_decision()
 
-    # 1. missing context packet
-    scenarios.append(("missing packet", {"state_kwargs": {"with_packet": False}}))
-    # 2. model raises
-    # 3. unparseable output
-    # 4. directive rejected by the validator
-    for label, setup in (
-        ("model raises", {"raises": RuntimeError("boom")}),
-        ("unparseable", {"decision": None, "parsing_error": ValueError("refusal")}),
-    ):
-        scenarios.append((label, {"chain_kwargs": setup}))
+    if scenario == "missing_packet":
+        state_kwargs["with_packet"] = False
+    elif scenario == "model_raises":
+        decision_chain.raises = RuntimeError("boom")
+    elif scenario == "unparseable_output":
+        decision_chain.decision = None
+        decision_chain.parsing_error = ValueError("refusal")
 
-    for label, spec in scenarios:
-        decision_chain.raises = spec.get("chain_kwargs", {}).get("raises")
-        if "decision" in spec.get("chain_kwargs", {}):
-            decision_chain.decision = spec["chain_kwargs"]["decision"]
-            decision_chain.parsing_error = spec["chain_kwargs"]["parsing_error"]
-        else:
-            decision_chain.decision = make_decision()
-            decision_chain.parsing_error = None
+    update = await generate_decision_node(make_state(error_count=5, **state_kwargs), {})
 
-        state = make_state(error_count=5, **spec.get("state_kwargs", {}))
-        update = await generate_decision_node(state, {})
+    assert update["router_directive"] == "stay"
+    assert update.get("last_error"), "last_error not set"
+    assert update.get("error_count") == 6, "error_count did not increment by exactly 1"
 
-        assert update["router_directive"] == "stay", label
-        assert update.get("last_error"), f"{label}: last_error not set"
-        assert update.get("error_count") == 6, f"{label}: error_count did not increment by 1"
+
+def test_composed_directive_is_always_valid():
+    """Why there is no fourth error scenario above.
+
+    Every directive `_compose_directive` can emit is accepted by the
+    ChatAgentDecision validator, so the node's final validation gate cannot
+    fire. Exhaustive over all (action, modify_target) pairs a validated
+    SectionDecision can hold.
+
+    This is the test that would fail if someone changed _compose_directive to
+    emit a shape the validator rejects — at which point the defensive branch in
+    the node stops being dead code and the scenario list above needs a fourth
+    entry.
+    """
+    from itertools import product
+
+    from agents.xbuddy.models import ChatAgentDecision
+    from agents.xbuddy.nodes.generate_decision import _compose_directive
+
+    def build(action, target):
+        return SectionDecision(
+            action=action,
+            modify_target=target,
+            is_satisfied=None,
+            user_satisfaction_feedback=None,
+            should_save_content=False,
+            presented_summary=False,
+            decision_reason="x",
+        )
+
+    combinations = list(product(DecisionAction, [None, *SectionID]))
+    assert len(combinations) == 18
+
+    for action, target in combinations:
+        directive = _compose_directive(build(action, target))
+        # Raises ValidationError if the node's final gate would have rejected it.
+        ChatAgentDecision(
+            router_directive=directive,
+            user_satisfaction_feedback=None,
+            is_satisfied=None,
+            should_save_content=False,
+        )
+        assert directive in ("stay", "next") or directive.startswith("modify:")
+
+
+def test_pydantic_blocks_out_of_range_actions_and_targets():
+    """The upstream half of the same argument.
+
+    An invalid action or target never reaches _compose_directive: Pydantic
+    rejects it while parsing, which routes to the unparseable-output path
+    instead.
+    """
+    from pydantic import ValidationError
+
+    base = {
+        "action": "stay",
+        "modify_target": None,
+        "is_satisfied": None,
+        "user_satisfaction_feedback": None,
+        "should_save_content": False,
+        "presented_summary": False,
+        "decision_reason": "x",
+    }
+    for bad in ({"action": "skip"}, {"action": "STAY"}, {"modify_target": "nonsense"}):
+        with pytest.raises(ValidationError):
+            SectionDecision(**{**base, **bad})
 
 
 @pytest.mark.asyncio

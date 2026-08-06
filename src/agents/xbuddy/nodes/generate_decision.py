@@ -260,8 +260,21 @@ async def generate_decision_node(state: XBuddyState, config: RunnableConfig) -> 
 
     directive = _compose_directive(decision)
 
-    # Final gate: the existing ChatAgentDecision validator is the same one the
-    # rest of the codebase trusts. If it rejects the composed string, fall back.
+    # Final gate against the same ChatAgentDecision validator the rest of the
+    # codebase trusts.
+    #
+    # UNREACHABLE BY CONSTRUCTION, kept as defence in depth. _compose_directive
+    # has five return statements: four yield the literals "stay"/"next", the
+    # fifth an f-string prefixed "modify:". The validator accepts exactly those
+    # three shapes, so the function is total with respect to it — verified
+    # exhaustively over all 18 (action, modify_target) combinations a validated
+    # SectionDecision can hold, and over hostile model_construct inputs that
+    # bypass Pydantic entirely. Neither reaches the except branch.
+    #
+    # It stays because that proof rests on _compose_directive's current
+    # implementation rather than on a type guarantee: an edit there could start
+    # emitting something else, and this is what would catch it. Cost is one
+    # discarded object per turn. See test_composed_directive_is_always_valid.
     try:
         ChatAgentDecision(
             router_directive=directive,
