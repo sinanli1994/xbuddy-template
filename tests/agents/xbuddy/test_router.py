@@ -367,15 +367,33 @@ async def test_invalid_modify_does_not_reopen():
 
 
 @pytest.mark.asyncio
-async def test_initialize_then_router_through_compiled_graph():
-    """generate_reply is PR 3, so the run is expected to stop there."""
+async def test_initialize_then_router_through_compiled_graph(monkeypatch, make_decision):
+    """PR 2's router contract, still holding once the turn runs to completion.
+
+    Written for PR 2, when the graph stopped at generate_reply's
+    NotImplementedError. PR 3 implements that node, so the run now completes and
+    the two model calls are faked — without patching them the suite would reach
+    for the network.
+    """
     import uuid
 
     from agents.xbuddy.agent import graph
+    from agents.xbuddy.nodes import generate_decision as decision_module
+    from agents.xbuddy.nodes import generate_reply as reply_module
+
+    class FakeReply:
+        async def ainvoke(self, messages, config=None):
+            return AIMessage(content="What kind of role are you targeting next?")
+
+    class FakeDecision:
+        async def ainvoke(self, messages, config=None):
+            return {"raw": None, "parsed": make_decision(), "parsing_error": None}
+
+    monkeypatch.setattr(reply_module, "_reply_model", FakeReply)
+    monkeypatch.setattr(decision_module, "_decision_chain", FakeDecision)
 
     config = {"configurable": {"thread_id": str(uuid.uuid4()), "user_id": 7}}
-    with pytest.raises(NotImplementedError, match="PR 3"):
-        await graph.ainvoke({"messages": [HumanMessage(content="I need a new job")]}, config)
+    await graph.ainvoke({"messages": [HumanMessage(content="I need a new job")]}, config)
 
     values = (await graph.aget_state(config)).values
 
@@ -396,5 +414,5 @@ async def test_initialize_then_router_through_compiled_graph():
         "career_goal_summary",
         "target_timeline",
     ]
-    # The user's message was not duplicated by either node.
-    assert len(values["messages"]) == 1
+    # One human + one AI reply: neither node duplicated the history.
+    assert len(values["messages"]) == 2

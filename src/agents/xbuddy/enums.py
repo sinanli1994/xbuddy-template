@@ -1,6 +1,6 @@
 """Enumerations for your XBuddy Agent."""
 
-from enum import Enum
+from enum import Enum, StrEnum
 
 
 class SectionStatus(str, Enum):
@@ -15,6 +15,22 @@ class RouterDirective(str, Enum):
     STAY = "stay"
     NEXT = "next"
     MODIFY = "modify"  # Format: "modify:section_id"
+
+
+class DecisionAction(StrEnum):
+    """What the decision model chose to do about the active section.
+
+    Kept separate from RouterDirective: the model picks one of these three plus
+    a target section, and generate_decision composes the `modify:<id>` string.
+    The model never has to produce that syntax itself.
+
+    Uses StrEnum rather than the `(str, Enum)` pattern of the other enums in this
+    module. Those predate this PR and are left alone; new code should prefer
+    StrEnum, whose str() returns the value instead of "DecisionAction.STAY".
+    """
+    STAY = "stay"
+    NEXT = "next"
+    MODIFY = "modify"
 
 
 class SectionID(str, Enum):

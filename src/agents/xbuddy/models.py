@@ -9,7 +9,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field, field_validator
 
-from .enums import SectionID, SectionStatus
+from .enums import DecisionAction, SectionID, SectionStatus
 
 
 class SectionContent(BaseModel):
@@ -72,6 +72,53 @@ class XBuddyData(BaseModel):
 
     # --- Action Plan ---
     action_items: list[str] = Field(default_factory=list)
+
+
+class SectionDecision(BaseModel):
+    """Structured output returned by the decision model.
+
+    EVERY field is required — no Pydantic defaults. Fields that may carry no
+    value are required-but-nullable instead. OpenAI's strict json_schema mode
+    requires every key in `properties` to appear in `required`, and a field with
+    a default is omitted from `required`, which makes the schema invalid. With
+    defaults, only 2 of these 7 fields would be required.
+
+    Because nothing is optional, consumers must handle explicit nulls rather
+    than relying on defaults.
+
+    Verified against the live API with
+    `with_structured_output(SectionDecision, method="json_schema", strict=True,
+    include_raw=True)`: parsed round-trips and parsing_error is None.
+    """
+
+    action: DecisionAction = Field(
+        description="Whether to stay in the current section, move to the next, or modify another."
+    )
+    modify_target: SectionID | None = Field(
+        description="The section to jump to. Non-null only when action is 'modify'; null otherwise."
+    )
+    is_satisfied: bool | None = Field(
+        description=(
+            "True only if the agent presented a summary AND the user affirmed it. "
+            "Null when no summary has been presented or the user has not responded to one."
+        )
+    )
+    user_satisfaction_feedback: str | None = Field(
+        description="What the user said about the summary, if anything. Null otherwise."
+    )
+    should_save_content: bool = Field(
+        description="Whether the current section's content is worth persisting."
+    )
+    presented_summary: bool = Field(
+        description="True if the agent's most recent reply presented a summary of the section."
+    )
+    decision_reason: str = Field(
+        description=(
+            "One sentence naming the concrete, observable signal that drove this choice "
+            "(e.g. 'user confirmed the summary', 'target_timeline still empty'). "
+            "Do not narrate deliberation."
+        )
+    )
 
 
 class ChatAgentDecision(BaseModel):
