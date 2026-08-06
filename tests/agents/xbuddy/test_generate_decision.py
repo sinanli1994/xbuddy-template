@@ -64,9 +64,10 @@ async def test_parsing_error_falls_back(decision_chain, make_state):
     decision_chain.decision = None
     decision_chain.parsing_error = ValueError("schema refusal")
 
-    update = await generate_decision_node(make_state(), {})
+    update = await generate_decision_node(make_state(error_count=0), {})
     assert update["router_directive"] == "stay"
     assert "unparseable" in update["last_error"]
+    assert update["error_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -77,6 +78,64 @@ async def test_model_exception_falls_back_and_counts(decision_chain, make_state)
     assert update["router_directive"] == "stay"
     assert update["error_count"] == 3
     assert "rate limited" in update["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_every_error_path_records_and_counts_together(
+    decision_chain, make_state, make_decision
+):
+    """last_error and error_count must move as a pair.
+
+    They used to sit behind separate flags, so three of the four failure paths
+    recorded an error without ever counting it. Parametrising over all four
+    fails if they are ever allowed to drift apart again.
+    """
+    scenarios: list[tuple[str, dict]] = []
+
+    # 1. missing context packet
+    scenarios.append(("missing packet", {"state_kwargs": {"with_packet": False}}))
+    # 2. model raises
+    # 3. unparseable output
+    # 4. directive rejected by the validator
+    for label, setup in (
+        ("model raises", {"raises": RuntimeError("boom")}),
+        ("unparseable", {"decision": None, "parsing_error": ValueError("refusal")}),
+    ):
+        scenarios.append((label, {"chain_kwargs": setup}))
+
+    for label, spec in scenarios:
+        decision_chain.raises = spec.get("chain_kwargs", {}).get("raises")
+        if "decision" in spec.get("chain_kwargs", {}):
+            decision_chain.decision = spec["chain_kwargs"]["decision"]
+            decision_chain.parsing_error = spec["chain_kwargs"]["parsing_error"]
+        else:
+            decision_chain.decision = make_decision()
+            decision_chain.parsing_error = None
+
+        state = make_state(error_count=5, **spec.get("state_kwargs", {}))
+        update = await generate_decision_node(state, {})
+
+        assert update["router_directive"] == "stay", label
+        assert update.get("last_error"), f"{label}: last_error not set"
+        assert update.get("error_count") == 6, f"{label}: error_count did not increment by 1"
+
+
+@pytest.mark.asyncio
+async def test_reply_cap_is_not_an_error(decision_chain, make_state):
+    """The cap is normal control flow — it must neither count nor record."""
+    state = make_state(
+        error_count=5,
+        messages=[
+            HumanMessage(content="I need a job"),
+            AIMessage(content="one"),
+            AIMessage(content="two"),
+        ],
+    )
+    update = await generate_decision_node(state, {})
+
+    assert update["router_directive"] == "stay"
+    assert "error_count" not in update, "the cap is not a failure"
+    assert "last_error" not in update
 
 
 # --------------------------------------------------------------------------
@@ -157,11 +216,21 @@ async def test_under_the_cap_the_model_is_called(decision_chain, make_state, mak
 async def test_missing_context_packet_short_circuits_before_the_model(
     decision_chain, make_state
 ):
-    update = await generate_decision_node(make_state(with_packet=False), {})
+    """A missing packet is a real system error, and is accounted for as one.
 
+    It previously set last_error without touching error_count, so a repeatedly
+    failing router looked healthy to anything watching the counter.
+    """
+    update = await generate_decision_node(make_state(with_packet=False, error_count=3), {})
+
+    # Never reaches the model.
     assert decision_chain.call_count == 0, "must not decide without knowing the section"
+    # Safe STAY.
     assert update["router_directive"] == "stay"
+    # Recorded and counted, exactly once.
     assert "context_packet" in update["last_error"]
+    assert update["error_count"] == 4
+    # No messages, no navigation.
     assert "messages" not in update
     for key in NAVIGATION_KEYS:
         assert key not in update

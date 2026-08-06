@@ -157,10 +157,20 @@ def _build_update(
     return update
 
 
-def _stay_update(
-    state: XBuddyState, *, reason: str, error: bool = False, count_error: bool = False
-) -> dict[str, Any]:
-    """Safe exit: hold the section and let route_decision end the turn."""
+def _stay_update(state: XBuddyState, *, reason: str, error: bool = False) -> dict[str, Any]:
+    """Safe exit: hold the section and let route_decision end the turn.
+
+    One flag, deliberately. `error=True` means a real system failure, and it
+    both records `last_error` and increments `error_count` — the two can no
+    longer drift. They previously sat behind separate flags, which let three of
+    the four failure paths record an error without ever counting it.
+
+    `error=False` is for outcomes that are normal control flow rather than
+    failures: the reply cap is the only one, and it neither counts nor records.
+
+    Every safe exit routes through here, so error accounting lives in exactly
+    one place instead of being repeated per branch.
+    """
     logger.info("generate_decision: forcing stay (%s)", reason)
     update = _build_update(
         state,
@@ -169,7 +179,7 @@ def _stay_update(
         guard_path=True,
         error=reason if error else None,
     )
-    if count_error:
+    if error:
         update["error_count"] = state.get("error_count", 0) + 1
     return update
 
@@ -235,7 +245,7 @@ async def generate_decision_node(state: XBuddyState, config: RunnableConfig) -> 
     except Exception as exc:  # a failed decision must not kill the turn
         logger.exception("generate_decision: model call failed")
         return _stay_update(  # type: ignore[return-value]
-            state, reason=f"decision model error: {exc}", error=True, count_error=True
+            state, reason=f"decision model error: {exc}", error=True
         )
 
     parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
