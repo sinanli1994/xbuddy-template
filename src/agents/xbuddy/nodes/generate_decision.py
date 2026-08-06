@@ -274,7 +274,12 @@ async def generate_decision_node(state: XBuddyState, config: RunnableConfig) -> 
     # It stays because that proof rests on _compose_directive's current
     # implementation rather than on a type guarantee: an edit there could start
     # emitting something else, and this is what would catch it. Cost is one
-    # discarded object per turn. See test_composed_directive_is_always_valid.
+    # discarded object per turn.
+    #
+    # Both claims above are pinned by tests, so this comment cannot quietly go
+    # stale: test_composed_directive_is_always_valid covers the 18 validated
+    # combinations, test_hostile_model_construct_inputs_stay_validator_safe
+    # covers the bypassed ones.
     try:
         ChatAgentDecision(
             router_directive=directive,

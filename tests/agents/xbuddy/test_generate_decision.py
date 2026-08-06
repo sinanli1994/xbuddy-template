@@ -162,6 +162,75 @@ def test_composed_directive_is_always_valid():
         assert directive in ("stay", "next") or directive.startswith("modify:")
 
 
+@pytest.mark.parametrize(
+    ("label", "action", "target"),
+    [
+        # Hostile `action` values. None of these is DecisionAction.STAY or NEXT,
+        # so each falls through to the modify branch.
+        ("action=skip", "skip", None),
+        ("action=None", None, None),
+        ("action=42", 42, None),
+        ("action=empty", "", None),
+        ("action=sql", "'; DROP TABLE--", None),
+        # A plain string that *looks* like a valid action. `_compose_directive`
+        # compares with `is`, so this is not DecisionAction.STAY and degrades to
+        # the modify branch — still safe, which is the point.
+        ("action=stay-as-str", "stay", None),
+        # Hostile `modify_target` values, with a real action.
+        ("target=not_a_section", DecisionAction.MODIFY, "not_a_section"),
+        ("target=traversal", DecisionAction.MODIFY, "../../etc/passwd"),
+        ("target=shell", DecisionAction.MODIFY, "career_goal; rm -rf /"),
+        ("target=sql", DecisionAction.MODIFY, "'; DROP TABLE--"),
+        ("target=wrong_case", DecisionAction.MODIFY, "CAREER_GOAL"),
+        ("target=whitespace", DecisionAction.MODIFY, " career_goal"),
+        ("target=empty", DecisionAction.MODIFY, ""),
+        ("target=int", DecisionAction.MODIFY, 123),
+        ("target=list", DecisionAction.MODIFY, ["career_goal"]),
+        ("target=dict", DecisionAction.MODIFY, {"x": 1}),
+        ("target=bytes", DecisionAction.MODIFY, b"career_goal"),
+        # Both hostile at once.
+        ("both", "bogus", "also_bogus"),
+    ],
+)
+def test_hostile_model_construct_inputs_stay_validator_safe(label, action, target):
+    """Pins the second half of the defensive-branch comment in the node.
+
+    `model_construct` skips Pydantic entirely, so this is the only way an
+    out-of-range action or target can reach `_compose_directive` at all. Even
+    then the composed directive must validate through the real
+    ChatAgentDecision and land on a safe shape.
+
+    Also pins the interpolation property: the f-string uses
+    `SectionID(target).value`, never the raw target, so only the five canonical
+    section values can ever follow "modify:". A hostile payload cannot appear in
+    the output.
+    """
+    from agents.xbuddy.models import ChatAgentDecision
+    from agents.xbuddy.nodes.generate_decision import _compose_directive
+
+    decision = SectionDecision.model_construct(action=action, modify_target=target)
+
+    # Must not raise: _compose_directive is called outside the node's try block,
+    # so an escaping exception would crash the turn rather than degrade it.
+    directive = _compose_directive(decision)
+
+    # Validates through the real model the node uses as its final gate.
+    ChatAgentDecision(
+        router_directive=directive,
+        user_satisfaction_feedback=None,
+        is_satisfied=None,
+        should_save_content=False,
+    )
+
+    # Resolves to a safe accepted shape.
+    valid_modifies = {f"modify:{section.value}" for section in SectionID}
+    assert directive in {"stay", "next"} | valid_modifies, f"{label}: unsafe shape {directive!r}"
+
+    # The hostile payload is never interpolated into the directive.
+    if isinstance(target, str) and target and target not in {s.value for s in SectionID}:
+        assert target not in directive, f"{label}: payload leaked into {directive!r}"
+
+
 def test_pydantic_blocks_out_of_range_actions_and_targets():
     """The upstream half of the same argument.
 
