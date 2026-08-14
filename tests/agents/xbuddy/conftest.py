@@ -143,6 +143,114 @@ def reply_model(monkeypatch):
     return fake
 
 
+class PersistenceRecorder:
+    """Replaces `persist_section` in memory_updater for every agent test.
+
+    Callable with the real signature, records each attempt, and returns whatever
+    the test configured. `fail_sections` fails only the named sections so retry
+    ordering can be observed; `fail` fails everything.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.fail = False
+        self.fail_sections: set[str] = set()
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def sections(self) -> list[str]:
+        """Section values in the exact order they were attempted."""
+        return [call["section_id"] for call in self.calls]
+
+    async def __call__(self, user_id, thread_id, section_id, section, user_data):
+        value = section_id.value if hasattr(section_id, "value") else str(section_id)
+        self.calls.append(
+            {
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "section_id": value,
+                "status": section.status.value,
+                "user_data": user_data,
+            }
+        )
+        return not (self.fail or value in self.fail_sections)
+
+
+@pytest.fixture(autouse=True)
+def persistence(monkeypatch):
+    """Autouse guard: no agent test may reach the live Supabase project.
+
+    `Settings` reads `.env` through `env_file=find_dotenv()`, so real credentials
+    are visible during tests. Without this fixture, any test exercising
+    memory_updater writes rows to the real database — which happened once during
+    Stage 5 development and left four stray rows behind.
+
+    Tests that want to observe or steer persistence request `persistence` by name;
+    everything else gets the guard for free.
+    """
+    from agents.xbuddy.nodes import memory_updater as module
+
+    recorder = PersistenceRecorder()
+    monkeypatch.setattr(module, "persist_section", recorder)
+    return recorder
+
+
+class RecordingExtractionChain:
+    """Stands in for the structured-output chain in memory_updater.
+
+    Returns the include_raw shape. `_extraction_chain` takes the section's model
+    as an argument, so the fake records which schema it was built for — that is
+    how the section-scoping test asserts the right model was selected.
+    """
+
+    def __init__(self):
+        self.extracted: Any = None
+        self.parsing_error: Exception | None = None
+        self.raises: Exception | None = None
+        self.models: list[type] = []
+        self.calls: list[list[Any]] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def last_model(self) -> type:
+        return self.models[-1]
+
+    @property
+    def last_system_prompt(self) -> str:
+        return self.calls[-1][0].content
+
+    def build(self, extract_model):
+        """Mimics `_extraction_chain(extract_model)` returning a runnable."""
+        self.models.append(extract_model)
+        return self
+
+    async def ainvoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        if self.raises is not None:
+            raise self.raises
+        return {
+            "raw": AIMessage(content=""),
+            "parsed": self.extracted,
+            "parsing_error": self.parsing_error,
+        }
+
+
+@pytest.fixture
+def extraction_chain(monkeypatch):
+    """Patch memory_updater's chain builder; tests set `.extracted` / `.raises`."""
+    from agents.xbuddy.nodes import memory_updater as module
+
+    fake = RecordingExtractionChain()
+    monkeypatch.setattr(module, "_extraction_chain", fake.build)
+    return fake
+
+
 @pytest.fixture
 def decision_chain(monkeypatch):
     """Patch generate_decision's chain; tests set `.decision` / `.raises`."""

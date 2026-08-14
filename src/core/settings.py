@@ -115,7 +115,19 @@ class Settings(BaseSettings):
     MONGO_AUTH_SOURCE: str | None = None
 
     # Supabase Configuration
+    #
+    # Two generations of API keys are supported. The newer names take precedence
+    # (see integrations/supabase/supabase_client._resolve_backend_key); the legacy
+    # JWT names are kept so existing deployments keep working.
+    #
+    #   SUPABASE_SECRET_KEY       (sb_secret_...)      replaces SERVICE_ROLE_KEY
+    #   SUPABASE_PUBLISHABLE_KEY  (sb_publishable_...) replaces ANON_KEY
+    #
+    # These must be declared here to have any effect: model_config sets
+    # extra="ignore", so an undeclared name in .env is silently dropped.
     SUPABASE_URL: str | None = None
+    SUPABASE_SECRET_KEY: SecretStr | None = None
+    SUPABASE_PUBLISHABLE_KEY: SecretStr | None = None
     SUPABASE_ANON_KEY: SecretStr | None = None
     SUPABASE_SERVICE_ROLE_KEY: SecretStr | None = None
     SUPABASE_DB_URL: str | None = None

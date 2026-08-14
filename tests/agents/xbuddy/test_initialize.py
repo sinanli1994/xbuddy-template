@@ -56,6 +56,7 @@ def fully_populated_state() -> dict:
         "last_error": None,
         "final_output": None,
         "should_generate_final_output": False,
+        "persistence_pending": [],
     }
 
 
