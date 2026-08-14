@@ -633,3 +633,82 @@ async def test_missing_packet_skips_progress_too(extraction_chain, make_state):
     assert "section_states" not in update
     assert "should_generate_final_output" not in update
     assert update["last_error"]
+
+
+# --------------------------------------------------------------------------
+# should_save_content does not gate persistence — the disagreement is intended
+#
+# `SectionDecision.should_save_content` is a required field of the strict
+# decision schema, but DECISION_RULES never defines it, so the model emits it
+# with no rule to apply. Persistence is gated on `current_is_dirty` instead —
+# whether the durable row would actually differ. The two disagree in both
+# directions, and both directions are deliberate. See the comment beside
+# `current_is_dirty` in memory_updater.py.
+# --------------------------------------------------------------------------
+
+
+def decided(*, should_save_content: bool, is_satisfied: bool | None = None) -> ChatAgentOutput:
+    """An agent_output with the advisory flag set explicitly.
+
+    Written out rather than reusing `satisfied()`, whose hardcoded
+    `should_save_content=False` is exactly the detail these tests are about.
+    """
+    return ChatAgentOutput(
+        reply="So: Senior SRE within 3 months. Right?",
+        router_directive="stay",
+        is_satisfied=is_satisfied,
+        user_satisfaction_feedback=None,
+        should_save_content=should_save_content,
+    )
+
+
+@pytest.mark.asyncio
+async def test_persists_despite_should_save_content_false(
+    extraction_chain, make_state, persistence
+):
+    """A real state change is written even when the model advises against saving.
+
+    The dangerous direction: honouring the flag here would drop freshly captured
+    user data without queueing it in `persistence_pending`, so the durable record
+    would fall silently behind state — the exact failure the retry queue exists to
+    make visible.
+    """
+    extraction_chain.extracted = career_goal(target_roles=["Senior SRE"])
+    state = make_state(
+        messages=turn(),
+        agent_output=decided(should_save_content=False),
+        section_states=sections_with(career_goal=SectionStatus.IN_PROGRESS),
+    )
+
+    update = await memory_updater_node(state, {})
+
+    assert state["agent_output"].should_save_content is False
+    assert update["user_data"].target_roles == ["Senior SRE"], "extraction must have changed state"
+    assert persistence.sections == ["career_goal"], "a dirty section is persisted regardless"
+    assert "persistence_pending" not in update
+
+
+@pytest.mark.asyncio
+async def test_does_not_persist_despite_should_save_content_true(
+    extraction_chain, make_state, persistence
+):
+    """An unchanged section is not written even when the model advises saving.
+
+    All-null extraction means "nothing new was said", the common case. Honouring
+    the flag here would re-upsert a byte-identical row every turn, spending a
+    network round-trip on the path most likely to fail.
+    """
+    extraction_chain.extracted = career_goal()  # every field None -> no merge
+    state = make_state(
+        messages=turn(),
+        user_data=XBuddyData(target_roles=["Senior SRE"]),
+        agent_output=decided(should_save_content=True),
+        section_states=sections_with(career_goal=SectionStatus.IN_PROGRESS),
+    )
+
+    update = await memory_updater_node(state, {})
+
+    assert state["agent_output"].should_save_content is True
+    assert "user_data" not in update, "nothing extracted, so nothing changed"
+    assert "section_states" not in update, "no status change either"
+    assert persistence.calls == [], "a clean section is not re-written"

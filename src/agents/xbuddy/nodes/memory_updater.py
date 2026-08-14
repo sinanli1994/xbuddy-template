@@ -364,6 +364,17 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
 
     # The current section's durable row differs when its status changed or when
     # extraction produced new content for it.
+    #
+    # `agent_output.should_save_content` is deliberately NOT the gate here, even
+    # though it is available on the same state. DECISION_RULES never mentions it
+    # (see sections/base_prompt.py), so the model emits it with no rule to apply —
+    # it is advisory, not authoritative. Durable writes follow actual state
+    # changes instead: this is a fact about whether the row would differ, not a
+    # judgement about whether it deserves saving. The two legitimately disagree
+    # in both directions, and the tests named
+    # `test_persists_despite_should_save_content_false` and
+    # `test_does_not_persist_despite_should_save_content_true` pin that as
+    # intended rather than accidental.
     current_is_dirty = "section_states" in progress or merged is not None
 
     try:
