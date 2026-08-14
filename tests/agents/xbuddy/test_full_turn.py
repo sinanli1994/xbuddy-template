@@ -18,6 +18,7 @@ from langchain_community.chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agents.xbuddy.enums import DecisionAction, SectionID, SectionStatus
+from agents.xbuddy.models import SectionState
 from agents.xbuddy.nodes.generate_decision import INTERNAL_DECISION_TAG, generate_decision_node
 from agents.xbuddy.nodes.generate_reply import generate_reply_node
 
@@ -68,14 +69,50 @@ class CountingReplyModel:
         return await self.model.ainvoke(messages, config)
 
 
+class FakeExtractionChain:
+    """Fakes memory_updater's extraction call.
+
+    Without this the graph tests reach for the real API on every run: the node
+    catches the resulting auth error into its fallback, so the tests still pass
+    while making network round-trips and silently exercising only the failure
+    path. `extracted=None` + a parsing_error keeps the merge a no-op, so these
+    tests observe routing rather than extraction.
+    """
+
+    def __init__(self, extracted=None):
+        self.extracted = extracted
+        self.calls: list = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    def build(self, extract_model):
+        return self
+
+    async def ainvoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        return {
+            "raw": AIMessage(content=""),
+            "parsed": self.extracted,
+            "parsing_error": None if self.extracted is not None else ValueError("no-op"),
+        }
+
+
 def _patch_graph(monkeypatch, decision):
     from agents.xbuddy.agent import graph
     from agents.xbuddy.nodes import generate_decision as decision_module
     from agents.xbuddy.nodes import generate_reply as reply_module
+    from agents.xbuddy.nodes import memory_updater as memory_module
 
-    fakes = {"reply": CountingReplyModel(), "decision": StreamingDecisionChain(decision)}
+    fakes = {
+        "reply": CountingReplyModel(),
+        "decision": StreamingDecisionChain(decision),
+        "extraction": FakeExtractionChain(),
+    }
     monkeypatch.setattr(reply_module, "_reply_model", lambda: fakes["reply"])
     monkeypatch.setattr(decision_module, "_decision_chain", lambda: fakes["decision"])
+    monkeypatch.setattr(memory_module, "_extraction_chain", fakes["extraction"].build)
     return graph, fakes
 
 
@@ -89,6 +126,25 @@ def graph_with_fakes(monkeypatch, make_decision):
 def graph_with_fakes_next(monkeypatch, make_decision):
     """Decision always says `next` — the runaway-loop scenario."""
     return _patch_graph(monkeypatch, make_decision(action=DecisionAction.NEXT))
+
+
+@pytest.fixture
+def graph_with_satisfied_next(monkeypatch, make_decision):
+    """Decision says `next` AND reports the user confirmed the summary.
+
+    This is the combination PR 4 Stage 3 makes meaningful: before it, nothing
+    marked a section DONE so `next` could not advance.
+    """
+    return _patch_graph(
+        monkeypatch,
+        make_decision(
+            action=DecisionAction.NEXT,
+            presented_summary=True,
+            is_satisfied=True,
+            user_satisfaction_feedback="confirmed",
+            decision_reason="user confirmed the summary",
+        ),
+    )
 
 
 def make_config() -> dict:
@@ -253,3 +309,94 @@ async def test_next_happy_model_still_terminates(graph_with_fakes_next):
     assert fakes["reply"].call_count == 2
     assert values["router_directive"] == "stay"
     assert len([m for m in values["messages"] if isinstance(m, AIMessage)]) == 2
+
+
+# --------------------------------------------------------------------------
+# PR 4 Stage 3: real section progression through the compiled graph
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_satisfied_career_goal_progresses_to_background(graph_with_satisfied_next):
+    """The progression PR 3 could not achieve.
+
+    Before Stage 3 nothing marked a section DONE, so `next` asked
+    get_next_unfinished_section for the next section and got the *same* one back
+    forever. With the DONE transition in place the router genuinely advances.
+    """
+    graph, _ = graph_with_satisfied_next
+    config = make_config()
+
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="yes, that's right")]},
+        {**config, "recursion_limit": 12},
+    )
+    values = (await graph.aget_state(config)).values
+
+    assert values["section_states"]["career_goal"].status is SectionStatus.DONE
+    assert values["current_section"] is SectionID.BACKGROUND, (
+        "a satisfied Career Goal must hand off to Background"
+    )
+    assert values["section_states"]["background"].status is SectionStatus.IN_PROGRESS
+    # The remaining three are untouched.
+    for section in (SectionID.JOB_PREFERENCES, SectionID.SKILL_ASSESSMENT, SectionID.ACTION_PLAN):
+        assert values["section_states"][section.value].status is SectionStatus.PENDING
+
+    # Not complete yet, so the implementation branch is not taken.
+    assert values.get("should_generate_final_output", False) is False
+
+
+@pytest.mark.asyncio
+async def test_fifth_section_completion_reaches_implementation_without_raising(
+    graph_with_satisfied_next,
+):
+    """route_after_memory_updater sends the turn to implementation_node here.
+
+    Before Stage 3's pass-through that node raised NotImplementedError, so
+    completing the final section would have taken the whole turn down.
+    """
+    graph, _ = graph_with_satisfied_next
+    config = make_config()
+
+    four_done = {
+        section.value: SectionState(
+            section_id=section,
+            status=(
+                SectionStatus.IN_PROGRESS
+                if section is SectionID.ACTION_PLAN
+                else SectionStatus.DONE
+            ),
+        )
+        for section in SectionID
+    }
+
+    # No pytest.raises: reaching implementation must be uneventful.
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="yes, ship it")],
+            "section_states": four_done,
+            "current_section": SectionID.ACTION_PLAN,
+            "router_directive": "stay",
+        },
+        {**config, "recursion_limit": 12},
+    )
+    values = (await graph.aget_state(config)).values
+
+    assert all(
+        values["section_states"][section.value].status is SectionStatus.DONE
+        for section in SectionID
+    ), "all five sections should be done"
+    assert values["should_generate_final_output"] is True
+
+
+@pytest.mark.asyncio
+async def test_implementation_node_is_a_pure_compatibility_no_op():
+    """PR 5 owns synthesis. Stage 3 only keeps the graph traversable."""
+    from agents.xbuddy.nodes.implementation import implementation_node
+
+    update = await implementation_node({"messages": []}, {})
+
+    assert update == {}
+    # Nothing synthesized, nothing finished, nothing persisted.
+    for key in ("final_output", "finished", "messages", "section_states"):
+        assert key not in update

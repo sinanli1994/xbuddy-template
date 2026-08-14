@@ -74,6 +74,85 @@ class XBuddyData(BaseModel):
     action_items: list[str] = Field(default_factory=list)
 
 
+class CareerGoalExtract(BaseModel):
+    """What the extraction model returns for the Career Goal section.
+
+    Field names mirror that section's `required_fields` exactly, and every field
+    is required-but-nullable — no Pydantic defaults. OpenAI's strict json_schema
+    mode requires every key in `properties` to appear in `required`, and a field
+    with a default is omitted from `required`, invalidating the schema. Verified
+    against the live API for SectionDecision in PR 3; the same rule applies here.
+
+    `None` means "no new information in this turn", never "clear the stored
+    value" — see extraction.merge_extraction.
+    """
+
+    target_roles: list[str] | None = Field(
+        description="Job titles the user is targeting. Null if not mentioned this turn."
+    )
+    career_goal_summary: str | None = Field(
+        description="One or two sentences, in the user's words, on what this move should change."
+    )
+    target_timeline: str | None = Field(
+        description="When they want to be in the new role, free text. Null if not mentioned."
+    )
+
+
+class BackgroundExtract(BaseModel):
+    """Extraction schema for the Background section. See CareerGoalExtract."""
+
+    current_role: str | None = Field(description="Their current or most recent role.")
+    years_experience: int | None = Field(description="Total relevant years, as a whole number.")
+    highest_education: str | None = Field(description="Highest or most relevant qualification.")
+    work_history: list[str] | None = Field(
+        description="Relevant roles, one line each: context, role, rough dates."
+    )
+
+
+class JobPreferencesExtract(BaseModel):
+    """Extraction schema for the Job Preferences section. See CareerGoalExtract."""
+
+    preferred_locations: list[str] | None = Field(description="Cities, regions, or 'remote'.")
+    preferred_work_modes: list[str] | None = Field(description="remote / hybrid / on-site.")
+    target_industries: list[str] | None = Field(description="Sectors they want to work in.")
+    employment_types: list[str] | None = Field(
+        description="full-time / part-time / contract / freelance / internship."
+    )
+    salary_expectation: str | None = Field(
+        description="Free text in the user's own currency and period."
+    )
+
+
+class SkillAssessmentExtract(BaseModel):
+    """Extraction schema for the Skill Assessment section. See CareerGoalExtract."""
+
+    strengths: list[str] | None = Field(description="What they are good at, ideally with evidence.")
+    current_skills: list[str] | None = Field(description="Concrete skills they can claim today.")
+    skill_gaps: list[str] | None = Field(
+        description="What the target role expects that they cannot yet evidence."
+    )
+
+
+class ActionPlanExtract(BaseModel):
+    """Extraction schema for the Action Plan section. See CareerGoalExtract."""
+
+    action_items: list[str] | None = Field(
+        description="Concrete, individually startable steps the user agreed to."
+    )
+
+
+# Which extraction schema to use for each section. Mirrors SECTION_TEMPLATES:
+# the field names of each model must equal that section's `required_fields`,
+# which a test asserts so the two cannot drift.
+EXTRACT_MODELS: dict[SectionID, type[BaseModel]] = {
+    SectionID.CAREER_GOAL: CareerGoalExtract,
+    SectionID.BACKGROUND: BackgroundExtract,
+    SectionID.JOB_PREFERENCES: JobPreferencesExtract,
+    SectionID.SKILL_ASSESSMENT: SkillAssessmentExtract,
+    SectionID.ACTION_PLAN: ActionPlanExtract,
+}
+
+
 class SectionDecision(BaseModel):
     """Structured output returned by the decision model.
 
@@ -207,6 +286,13 @@ class XBuddyState(MessagesState):
     # Error tracking
     error_count: NotRequired[int]
     last_error: NotRequired[str | None]
+
+    # Sections whose Supabase write failed and should be retried on the next
+    # memory_updater run. Canonical SectionID.value strings, each at most once.
+    # State is allowed to run ahead of the durable record — the checkpoint is
+    # primary for a live thread — and this queue is what keeps that divergence
+    # observable instead of silent.
+    persistence_pending: NotRequired[list[str]]
 
     # Final output — the generated job search strategy
     final_output: NotRequired[str | None]

@@ -124,8 +124,43 @@ When uncertain, choose stay. It is always safe: it keeps the user where they are
 and costs nothing but one more exchange.
 """
 
+# System prompt for the extraction model. Machine-facing: the output is
+# structured JSON that never reaches the user, and the call is tagged so the
+# service suppresses its tokens.
+EXTRACTION_RULES = """You extract structured facts from a career-coaching conversation. You do not
+talk to the user and you do not write prose. You read the recent exchange and
+return only what the user actually said.
+
+WHAT TO EXTRACT
+Only the fields listed for the CURRENT SECTION below. Ignore anything belonging
+to another section, even if the user volunteered it — a later section will
+collect it.
+
+USE NULL, NOT AN EMPTY LIST
+Return null for any field the user has not given a value for in this
+conversation. Do not return an empty list to mean "nothing" — null is the
+signal for "no information". An empty list is discarded.
+
+NEVER GUESS
+- Do not infer seniority, location, salary, or industry from job titles.
+- Do not convert a vague statement into a specific value. "I want to move up"
+  is not a job title; return null for target_roles.
+- Do not carry a value over from another field because it seems related.
+- If the agent proposed something and the user has not agreed to it, that is
+  not the user's answer. Return null.
+
+CORRECTIONS
+If the user revised an earlier answer, return the NEW value. It replaces the
+old one. For list fields, return the complete corrected list, not just the
+additions — a narrowed list replaces a wider one.
+
+If nothing new was said about this section, return null for every field. That
+is a valid and common result.
+"""
+
 BASE_PROMPTS = {
     "base_rules": BASE_RULES,
     "satisfaction_overlay": SATISFACTION_OVERLAY,
     "decision_rules": DECISION_RULES,
+    "extraction_rules": EXTRACTION_RULES,
 }

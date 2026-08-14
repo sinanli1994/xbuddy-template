@@ -9,34 +9,56 @@ logger = logging.getLogger(__name__)
 _supabase_client: Optional[Client] = None
 
 
+# Backend key candidates, in resolution order. The newer sb_secret_... key wins;
+# the legacy service-role JWT is the fallback so existing deployments keep working.
+# Both bypass RLS, which is required: new tables get RLS enabled with no policies,
+# so a publishable key would be denied every write.
+_BACKEND_KEY_VARS = ("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY")
+
+
+def _resolve_backend_key() -> tuple[str | None, str | None]:
+    """Return (key_value, source_variable_name) for the server-side key.
+
+    Only the *name* of the variable is ever surfaced to callers for logging —
+    never the value.
+    """
+    for name in _BACKEND_KEY_VARS:
+        raw = getattr(settings, name, None)
+        if raw is None:
+            continue
+        value = raw.get_secret_value() if hasattr(raw, 'get_secret_value') else str(raw)
+        if value and value.strip():
+            return value, name
+    return None, None
+
+
 def get_supabase_client() -> Client:
     """Get or create Supabase client instance."""
     global _supabase_client
-    
+
     if _supabase_client is None:
         supabase_url = getattr(settings, 'SUPABASE_URL', None)
-        supabase_key = getattr(settings, 'SUPABASE_SERVICE_ROLE_KEY', None)
-        
-        logger.info(f"Supabase config check - URL: {supabase_url is not None}, Key: {supabase_key is not None}")
-        
-        if not supabase_url or not supabase_key:
+        key_value, key_source = _resolve_backend_key()
+
+        # Presence and source only — never the key itself.
+        logger.info(
+            "Supabase config check - URL: %s, key source: %s",
+            supabase_url is not None,
+            key_source or "none",
+        )
+
+        if not supabase_url or not key_value:
             error_msg = (
-                "Supabase credentials not configured. "
-                "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables."
+                "Supabase credentials not configured. Set SUPABASE_URL and "
+                "SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY)."
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
-        # Get the actual key value (handle SecretStr)
-        if hasattr(supabase_key, 'get_secret_value'):
-            key_value = supabase_key.get_secret_value()
-        else:
-            key_value = str(supabase_key)
-        
+
         logger.info(f"Creating Supabase client with URL: {supabase_url}")
         _supabase_client = create_client(supabase_url, key_value)
-        logger.info("✅ Supabase client initialized successfully")
-    
+        logger.info("✅ Supabase client initialized successfully (key: %s)", key_source)
+
     return _supabase_client
 
 
@@ -83,22 +105,39 @@ class SupabaseClient:
         plain_text: str,
         status: str,
         satisfaction_status: Optional[str] = None,
-        agent_id: str = "founder-buddy"
+        agent_id: str = "xbuddy"
     ) -> dict:
-        """Save section state to Supabase (synchronous operation)."""
+        """Save section state to Supabase (synchronous operation).
+
+        `on_conflict` names the exact columns of the table's
+        UNIQUE(user_id, thread_id, section_id) constraint. Without it the
+        conflict target defaults to the UUID primary key; since no `id` is sent,
+        a repeat write for the same section INSERTs and violates that unique
+        constraint. The explicit target is what makes writes idempotent.
+
+        `agent_id` defaults to "xbuddy" so it matches what the read paths filter
+        on (service.py queries .eq("agent_id", agent_id) with the agent key).
+        The old "founder-buddy" default wrote rows that those reads could never
+        find. Note the column is not part of the unique constraint, so a second
+        agent sharing a thread_id would update this row rather than add its own —
+        tracked as a deferred schema improvement.
+        """
         try:
-            result = self.client.table("section_states").upsert({
-                "user_id": user_id,
-                "thread_id": thread_id,
-                "agent_id": agent_id,
-                "section_id": section_id,
-                "content": content,
-                "plain_text": plain_text,
-                "status": status,
-                "satisfaction_status": satisfaction_status,
-                "updated_at": "now()"
-            }).execute()
-            
+            result = self.client.table("section_states").upsert(
+                {
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "agent_id": agent_id,
+                    "section_id": section_id,
+                    "content": content,
+                    "plain_text": plain_text,
+                    "status": status,
+                    "satisfaction_status": satisfaction_status,
+                    "updated_at": "now()",
+                },
+                on_conflict="user_id,thread_id,section_id",
+            ).execute()
+
             logger.info(f"Section state saved: {section_id} for user {user_id}")
             return {"success": True, "data": result.data}
         except Exception as e:
