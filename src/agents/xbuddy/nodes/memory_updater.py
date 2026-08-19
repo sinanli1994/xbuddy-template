@@ -43,7 +43,7 @@ from pydantic import BaseModel
 from ..enums import SectionID, SectionStatus
 from ..extraction import extraction_changed, get_extract_model, merge_extraction
 from ..models import ContextPacket, SectionState, XBuddyData, XBuddyState
-from ..persistence import persist_section
+from ..persistence import mark_final_output_stale, persist_section
 from ..sections.base_prompt import EXTRACTION_RULES
 from ..state_factory import coerce_section_state
 
@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 
 # Tag the service uses to keep this call's tokens out of the user's stream.
 INTERNAL_EXTRACTION_TAG = "internal_extraction"
+
+# Mirrors nodes/implementation.FINAL_OUTPUT_PENDING_STALE. Duplicated as a
+# literal rather than imported: implementation imports nothing from this module
+# today and keeping it that way avoids a node-to-node import edge for one string.
+# `test_pending_constants_agree` pins the two together.
+FINAL_OUTPUT_PENDING_STALE = "stale"
 
 EXTRACTION_WINDOW_SIZE = 10
 
@@ -148,6 +154,80 @@ def _section_progress(state: XBuddyState, section_id: SectionID) -> dict[str, An
         update["should_generate_final_output"] = True
 
     return update
+
+
+def _invalidate_stale_artifact(
+    state: XBuddyState,
+    section_id: SectionID,
+    sections: dict[str, SectionState],
+    source_changed: bool,
+) -> tuple[dict[str, SectionState], dict[str, Any]]:
+    """PR 5 Stage 4: retire a final artifact whose source data just moved.
+
+    Returns `(sections, update_fragment)`. The returned mapping is what downstream
+    persistence should write, so a demotion reaches the durable row too.
+
+    `final_output` is a pure function of `user_data`, so *any* real change to
+    `user_data` makes the rendered document wrong — not only a correction to a value
+    the document quoted. Adding a fact that used to be unknown is just as
+    invalidating, because the artifact's "What I Still Don't Know" section asserted
+    its absence. `final_output is None` is the whole representation of "no valid
+    artifact"; there is no separate stale flag to keep in sync.
+
+    The trigger is `source_changed`, which the caller derives from
+    `merge_extraction` + `extraction_changed` — a value comparison, never a model
+    opinion. Expressing *intent* to modify is not enough: a `modify:` visit that
+    produces no new facts leaves a still-accurate document in place rather than
+    paying to regenerate an identical one. The confirmed Action Plan needs no special
+    case, because `action_items` is an `XBuddyData` field like any other, so a
+    changed plan is a changed source value.
+
+    Two further effects, both required for the reopened section to behave:
+
+    * **The active section is demoted from DONE to IN_PROGRESS**, unless this same
+      turn re-confirmed it. Without this, all five stay DONE and synthesis would run
+      again immediately against half-changed data. When the turn both corrects and
+      confirms, the confirmation is about the corrected summary the user just saw, so
+      promotion wins and the artifact regenerates in that turn.
+    * **`should_generate_final_output` is set False** when the demotion leaves the
+      set incomplete. It is otherwise only ever set True, so a demoted thread would
+      keep routing into `implementation` and log an ineligibility error every turn.
+      The once-only guard is still `final_output` itself, not this flag.
+    """
+    if not source_changed:
+        return sections, {}
+
+    fragment: dict[str, Any] = {}
+
+    if state.get("final_output"):
+        logger.info(
+            "memory_updater: source data changed; retiring the final output",
+        )
+        fragment["final_output"] = None
+
+    output = state.get("agent_output")
+    reconfirmed = output is not None and output.is_satisfied is True
+
+    active = sections.get(section_id.value)
+    if active is not None and active.status is SectionStatus.DONE and not reconfirmed:
+        logger.info(
+            "memory_updater: section %s reopened by a source change", section_id.value
+        )
+        sections = {
+            **sections,
+            section_id.value: active.model_copy(update={"status": SectionStatus.IN_PROGRESS}),
+        }
+        fragment["section_states"] = sections
+
+    all_done = all(
+        (entry := sections.get(section.value)) is not None
+        and entry.status is SectionStatus.DONE
+        for section in SectionID
+    )
+    if not all_done and state.get("should_generate_final_output"):
+        fragment["should_generate_final_output"] = False
+
+    return sections, fragment
 
 
 def _with_progress(progress: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -317,6 +397,32 @@ async def _persist(
     return update, errors
 
 
+async def _retire_durable_artifact(state: XBuddyState) -> tuple[dict[str, Any], list[str]]:
+    """Flag the durable row stale, keeping its content. Never raises.
+
+    Called when Stage 4 invalidation has just retired the graph artifact, and also
+    on a later turn when a previous attempt failed — `final_output_pending == "stale"`
+    is the whole retry mechanism, and it is idempotent because the update simply sets
+    the same status again.
+
+    A failure here must never undo the graph-side invalidation. The graph is the
+    source of truth: `final_output is None` already means "no valid artifact", and
+    refusing to invalidate because a database call failed would leave the agent
+    treating a document it knows is wrong as current. The cost of this ordering is
+    the reverse skew — a row still reading `current` while the graph knows better —
+    which `final_output_pending` makes visible and retries.
+    """
+    user_id = int(state.get("user_id", 1))
+    thread_id = str(state.get("thread_id", ""))
+
+    marked, reason = await mark_final_output_stale(user_id, thread_id)
+    if marked:
+        return {"final_output_pending": None}, []
+    return {"final_output_pending": FINAL_OUTPUT_PENDING_STALE}, [
+        reason or "final output stale marking failed"
+    ]
+
+
 async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState:
     """Capture the turn: extract facts, complete sections, persist the record.
 
@@ -362,6 +468,12 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
         for key, value in (state.get("section_states") or {}).items()
     }
 
+    # PR 5 Stage 4. Runs before persistence so a reopened section's demoted status
+    # reaches the durable row in the same turn that retires the artifact.
+    sections, lifecycle = _invalidate_stale_artifact(
+        state, packet.section_id, sections, merged is not None
+    )
+
     # The current section's durable row differs when its status changed or when
     # extraction produced new content for it.
     #
@@ -377,6 +489,15 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     # intended rather than accidental.
     current_is_dirty = "section_states" in progress or merged is not None
 
+    # PR 5 Stage 5. The durable row is retired when this turn invalidated the graph
+    # artifact, or when an earlier turn's attempt to do so failed.
+    retire_update: dict[str, Any] = {}
+    if "final_output" in lifecycle or (
+        state.get("final_output_pending") == FINAL_OUTPUT_PENDING_STALE
+    ):
+        retire_update, retire_errors = await _retire_durable_artifact(state)
+        errors.extend(retire_errors)
+
     try:
         persistence_update, persistence_errors = await _persist(
             state, packet, sections, effective_data, current_is_dirty
@@ -387,6 +508,11 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     errors.extend(persistence_errors)
 
     update = _with_progress(progress, persistence_update)
+    # Applied last: on a reopening turn the lifecycle fragment must win over the
+    # progress half, which computed `section_states` and the completion flag before
+    # extraction revealed that the source data had moved.
+    update.update(lifecycle)
+    update.update(retire_update)
     if merged is not None:
         update["user_data"] = merged
 

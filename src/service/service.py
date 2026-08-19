@@ -759,7 +759,7 @@ async def message_generator(
                 msg, metadata = event
                 # Skip messages with internal tags
                 tags = metadata.get("tags", [])
-                if any(tag in tags for tag in ["skip_stream", "internal_extraction", "do_not_stream", "internal_decision"]):
+                if any(tag in tags for tag in ["skip_stream", "internal_extraction", "do_not_stream", "internal_decision", "internal_synthesis"]):
                     logger.debug(f"Skipping message with internal tags: {tags}")
                     continue
                 # Only process AIMessageChunk for token streaming

@@ -20,6 +20,7 @@ conversation or rolling back a section already marked `DONE`.
 """
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
@@ -156,3 +157,171 @@ async def persist_section(
             (result or {}).get("error") if isinstance(result, dict) else "no result",
         )
     return success
+
+
+# ---------------------------------------------------------------------------
+# PR 5 — the final artifact
+# ---------------------------------------------------------------------------
+
+# Statuses stored in the durable row. 'current' means the document matches the
+# graph's live user_data; 'stale' means source memory moved after it was generated,
+# so the content is kept but is no longer authoritative. Invalidation never deletes.
+STATUS_CURRENT = "current"
+STATUS_STALE = "stale"
+
+
+def canonical_markdown(text: str | None) -> str:
+    """Normalize Markdown just enough that trivia does not read as an edit.
+
+    Line endings are unified and surrounding blank space trimmed, then a single
+    trailing newline is restored — which is exactly the shape
+    `render_final_output` already produces. Nothing semantic is normalized: this is
+    not an equivalence check, and two documents that differ only in wording are
+    correctly different.
+
+    A round trip through the editor (Markdown -> Tiptap -> Markdown) can reorder
+    whitespace, so it may report an edit where the user changed nothing visible.
+    That direction is the safe one: the consequence is refusing to overwrite, never
+    discarding someone's work.
+    """
+    if not text:
+        return ""
+    unified = text.replace("\r\n", "\n").replace("\r", "\n")
+    return unified.strip() + "\n"
+
+
+def content_fingerprint(text: str | None) -> str:
+    """SHA-256 of the canonical Markdown, hex encoded.
+
+    Deterministic and content-derived on purpose. `updated_at` cannot answer "was
+    this edited?" — the agent's own write moves it too — and asking a model would
+    make a data-integrity decision non-reproducible.
+    """
+    return hashlib.sha256(canonical_markdown(text).encode("utf-8")).hexdigest()
+
+
+def stored_markdown(row: dict[str, Any] | None) -> str | None:
+    """The text the editor would display for a row.
+
+    Mirrors the frontend's own `markdown_content || content` preference, so the
+    fingerprint is taken over the same bytes the user actually sees and edits.
+    """
+    if not row:
+        return None
+    return row.get("markdown_content") or row.get("content")
+
+
+def is_downstream_edited(row: dict[str, Any] | None) -> bool:
+    """Whether a row's content differs from the agent generation it records.
+
+    True means someone edited the document after the agent wrote it, so an
+    automatic overwrite would destroy their work.
+
+    A row with no `generated_content_hash` is treated as edited. That is the
+    conservative reading: the frontend never writes that column, so its absence
+    means no agent generation is on record for this content, and refusing to
+    overwrite costs a regeneration while overwriting could cost the user's document.
+    """
+    if not row:
+        return False
+    recorded = row.get("generated_content_hash")
+    if not recorded:
+        return True
+    return content_fingerprint(stored_markdown(row)) != recorded
+
+
+def _fetch_sync(user_id: int, thread_id: str) -> dict[str, Any] | None:
+    return _client().get_final_output(user_id=user_id, thread_id=thread_id)
+
+
+def _save_final_sync(
+    user_id: int, thread_id: str, markdown: str, fingerprint: str
+) -> dict:
+    return _client().save_final_output(
+        user_id=user_id,
+        thread_id=thread_id,
+        content=markdown,
+        markdown_content=markdown,
+        generated_content_hash=fingerprint,
+        status=STATUS_CURRENT,
+        agent_id=AGENT_ID,
+    )
+
+
+def _mark_stale_sync(user_id: int, thread_id: str) -> dict:
+    return _client().mark_final_output_stale(user_id=user_id, thread_id=thread_id)
+
+
+async def persist_final_output(
+    user_id: int, thread_id: str, markdown: str
+) -> tuple[bool, str | None]:
+    """Upsert the generated artifact unless doing so would destroy user edits.
+
+    Returns `(persisted, reason)`. Never raises.
+
+    `persisted=False` with a reason is a *refusal*, not necessarily a fault: the
+    most important case is a document the user has edited, which must be preserved
+    even though that leaves the durable row behind the graph. Preserving edits beats
+    automatic synchronization — the graph keeps the new artifact either way.
+
+    Idempotent: the same Markdown produces the same fingerprint, the upsert targets
+    the same conflict key, and one logical row results however many times it runs.
+    """
+    fingerprint = content_fingerprint(markdown)
+
+    try:
+        existing = await asyncio.to_thread(_fetch_sync, user_id, thread_id)
+    except Exception as exc:  # a read failure must not stall the turn
+        logger.exception("persist_final_output: could not read the existing row")
+        return False, f"final output read failed: {exc}"
+
+    if existing is not None:
+        if existing.get("generated_content_hash") == fingerprint:
+            # Byte-identical regeneration of a row we already wrote. Writing again
+            # would only move updated_at and wake the editor's realtime listener.
+            logger.info("persist_final_output: unchanged; nothing to write")
+            return True, None
+        if is_downstream_edited(existing):
+            logger.warning(
+                "persist_final_output: durable content was edited downstream; "
+                "refusing to overwrite user_id=%s thread=%s",
+                user_id,
+                thread_id,
+            )
+            return False, (
+                "final output not written: the stored document has been edited, "
+                "so the regenerated version was withheld to preserve those edits"
+            )
+
+    try:
+        result = await asyncio.to_thread(
+            _save_final_sync, user_id, thread_id, markdown, fingerprint
+        )
+    except Exception as exc:  # credentials or network; never fatal
+        logger.exception("persist_final_output: write failed")
+        return False, f"final output write failed: {exc}"
+
+    if not result.get("success"):
+        return False, f"final output write failed: {result.get('error')}"
+    return True, None
+
+
+async def mark_final_output_stale(user_id: int, thread_id: str) -> tuple[bool, str | None]:
+    """Flag the durable row as no longer authoritative, keeping its content.
+
+    Returns `(marked, reason)`. Never raises. Retaining the content is deliberate:
+    the user's last document stays readable while the agent rebuilds a replacement,
+    and deleting it would lose work in exchange for tidiness.
+
+    A thread with no row is a success with nothing to do — invalidation happens
+    whenever source data moves, including before any artifact was ever generated.
+    """
+    try:
+        result = await asyncio.to_thread(_mark_stale_sync, user_id, thread_id)
+    except Exception as exc:  # graph invalidation must not depend on this
+        logger.exception("mark_final_output_stale: failed")
+        return False, f"final output stale marking failed: {exc}"
+
+    if not result.get("success"):
+        return False, f"final output stale marking failed: {result.get('error')}"
+    return True, None
