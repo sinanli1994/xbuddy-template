@@ -179,6 +179,57 @@ class PersistenceRecorder:
         return not (self.fail or value in self.fail_sections)
 
 
+class FinalOutputRecorder:
+    """Replaces `persist_final_output` for every agent test.
+
+    Mirrors the real `(persisted, reason)` contract so a test can make the durable
+    write succeed, fail, or refuse without a database. `refuse_reason` reproduces the
+    user-edit refusal specifically, because the node branches on it: a refusal is not
+    retried, a failure is.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.fail = False
+        self.refuse_reason: str | None = None
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    @property
+    def markdowns(self) -> list[str]:
+        return [call["markdown"] for call in self.calls]
+
+    async def __call__(self, user_id, thread_id, markdown):
+        self.calls.append(
+            {"user_id": user_id, "thread_id": thread_id, "markdown": markdown}
+        )
+        if self.refuse_reason is not None:
+            return False, self.refuse_reason
+        if self.fail:
+            return False, "final output write failed: fake"
+        return True, None
+
+
+class StaleMarkRecorder:
+    """Replaces `mark_final_output_stale`, same `(marked, reason)` contract."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.fail = False
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    async def __call__(self, user_id, thread_id):
+        self.calls.append({"user_id": user_id, "thread_id": thread_id})
+        if self.fail:
+            return False, "final output stale marking failed: fake"
+        return True, None
+
+
 @pytest.fixture(autouse=True)
 def persistence(monkeypatch):
     """Autouse guard: no agent test may reach the live Supabase project.
@@ -186,15 +237,48 @@ def persistence(monkeypatch):
     `Settings` reads `.env` through `env_file=find_dotenv()`, so real credentials
     are visible during tests. Without this fixture, any test exercising
     memory_updater writes rows to the real database — which happened once during
-    Stage 5 development and left four stray rows behind.
+    PR 4 Stage 5 development and left four stray rows behind.
 
-    Tests that want to observe or steer persistence request `persistence` by name;
-    everything else gets the guard for free.
+    Covers **every** durable writer, not only sections. PR 5 added
+    `persist_final_output` and `mark_final_output_stale`, and the first PR 5 test run
+    reached for a real client through them precisely because this fixture patched
+    only `persist_section` — the same gap, caught the same way.
+
+    Tests that want to observe or steer persistence request `persistence`,
+    `final_output_persistence`, or `stale_marker` by name; everything else gets the
+    guard for free.
     """
-    from agents.xbuddy.nodes import memory_updater as module
+    from agents.xbuddy.nodes import implementation as implementation_module
+    from agents.xbuddy.nodes import memory_updater as memory_module
 
     recorder = PersistenceRecorder()
-    monkeypatch.setattr(module, "persist_section", recorder)
+    monkeypatch.setattr(memory_module, "persist_section", recorder)
+    monkeypatch.setattr(
+        implementation_module, "persist_final_output", FinalOutputRecorder()
+    )
+    monkeypatch.setattr(
+        memory_module, "mark_final_output_stale", StaleMarkRecorder(), raising=False
+    )
+    return recorder
+
+
+@pytest.fixture
+def final_output_persistence(monkeypatch):
+    """The durable final-output writer, steerable and observable."""
+    from agents.xbuddy.nodes import implementation as module
+
+    recorder = FinalOutputRecorder()
+    monkeypatch.setattr(module, "persist_final_output", recorder)
+    return recorder
+
+
+@pytest.fixture
+def stale_marker(monkeypatch):
+    """The durable stale-marking call, steerable and observable."""
+    from agents.xbuddy.nodes import memory_updater as module
+
+    recorder = StaleMarkRecorder()
+    monkeypatch.setattr(module, "mark_final_output_stale", recorder, raising=False)
     return recorder
 
 

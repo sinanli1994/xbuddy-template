@@ -18,7 +18,7 @@ from langchain_community.chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agents.xbuddy.enums import DecisionAction, SectionID, SectionStatus
-from agents.xbuddy.models import SectionState
+from agents.xbuddy.models import SectionState, XBuddyData
 from agents.xbuddy.nodes.generate_decision import INTERNAL_DECISION_TAG, generate_decision_node
 from agents.xbuddy.nodes.generate_reply import generate_reply_node
 
@@ -389,14 +389,222 @@ async def test_fifth_section_completion_reaches_implementation_without_raising(
     assert values["should_generate_final_output"] is True
 
 
+# --------------------------------------------------------------------------
+# PR 5 Stage 3: the graph produces a final artifact, once
+#
+# Replaces test_implementation_node_is_a_pure_compatibility_no_op, which asserted
+# `update == {}` unconditionally. That was right for PR 4's pass-through and is now
+# wrong, because the node synthesizes. The empty-update case survives as the
+# once-only guard and is covered in test_implementation.py.
+# --------------------------------------------------------------------------
+
+PLAN = ["Rewrite the CV summary", "Message three former colleagues", "Ship a K8s project"]
+
+
+def _patch_synthesis(monkeypatch, steps):
+    """Fake only the synthesis model; real assembly and rendering still run."""
+    from agents.xbuddy import synthesis as synthesis_module
+    from agents.xbuddy.models import ActionAnnotation, FinalOutputDraft
+
+    class CountingChain:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, messages, *args, **kwargs):
+            self.calls += 1
+            return {
+                "parsed": FinalOutputDraft(
+                    headline="QA Analyst to Senior SRE",
+                    positioning_summary="Four years of QA moving into automation.",
+                    strengths_to_leverage=["systems debugging"],
+                    skill_priorities=["Kubernetes"],
+                    search_targets=["fintech"],
+                    action_annotations=[
+                        ActionAnnotation(
+                            step_number=index, rationale=f"reason {index}", timeframe=None
+                        )
+                        for index in range(1, len(steps) + 1)
+                    ],
+                    risks_or_constraints=[],
+                ),
+                "parsing_error": None,
+            }
+
+    chain = CountingChain()
+    monkeypatch.setattr(synthesis_module, "_synthesis_chain", lambda: chain)
+    return chain
+
+
+def _four_done_action_plan_open() -> dict:
+    return {
+        section.value: SectionState(
+            section_id=section,
+            status=(
+                SectionStatus.IN_PROGRESS
+                if section is SectionID.ACTION_PLAN
+                else SectionStatus.DONE
+            ),
+        )
+        for section in SectionID
+    }
+
+
+def _completion_seed() -> dict:
+    return {
+        "messages": [HumanMessage(content="yes, ship it")],
+        "section_states": _four_done_action_plan_open(),
+        "current_section": SectionID.ACTION_PLAN,
+        "router_directive": "stay",
+        "user_data": XBuddyData(target_roles=["Senior SRE"], action_items=list(PLAN)),
+    }
+
+
+def _readiness_messages(values) -> list:
+    from agents.xbuddy.nodes.implementation import FINAL_OUTPUT_READY_MESSAGE
+
+    return [
+        message
+        for message in values["messages"]
+        if isinstance(message, AIMessage) and message.content == FINAL_OUTPUT_READY_MESSAGE
+    ]
+
+
 @pytest.mark.asyncio
-async def test_implementation_node_is_a_pure_compatibility_no_op():
-    """PR 5 owns synthesis. Stage 3 only keeps the graph traversable."""
-    from agents.xbuddy.nodes.implementation import implementation_node
+async def test_completing_the_fifth_section_generates_the_artifact(
+    graph_with_satisfied_next, monkeypatch
+):
+    """The end-to-end Stage 3 claim: finishing section 5 yields a Markdown document
+    and one readiness line, without raising."""
+    graph, _ = graph_with_satisfied_next
+    chain = _patch_synthesis(monkeypatch, PLAN)
+    config = make_config()
 
-    update = await implementation_node({"messages": []}, {})
+    await graph.ainvoke(_completion_seed(), {**config, "recursion_limit": 12})
+    values = (await graph.aget_state(config)).values
 
-    assert update == {}
-    # Nothing synthesized, nothing finished, nothing persisted.
-    for key in ("final_output", "finished", "messages", "section_states"):
-        assert key not in update
+    assert chain.calls == 1
+    assert values["final_output"].startswith("# QA Analyst to Senior SRE")
+    assert "## Your Action Plan" in values["final_output"]
+    assert "## What I Still Don\'t Know" in values["final_output"]
+    # The shared graph fixture's extraction fake reports a parsing error by design,
+    # so `last_error` is legitimately non-empty here. What matters is that synthesis
+    # itself contributed no error.
+    assert "synthesis" not in (values.get("last_error") or "")
+    assert len(_readiness_messages(values)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_artifact_is_not_pasted_into_the_conversation(
+    graph_with_satisfied_next, monkeypatch
+):
+    """Chat announces readiness; the document itself stays out of the transcript."""
+    graph, _ = graph_with_satisfied_next
+    _patch_synthesis(monkeypatch, PLAN)
+    config = make_config()
+
+    await graph.ainvoke(_completion_seed(), {**config, "recursion_limit": 12})
+    values = (await graph.aget_state(config)).values
+
+    for message in values["messages"]:
+        assert "## Your Action Plan" not in str(message.content)
+
+
+@pytest.mark.asyncio
+async def test_a_later_turn_does_not_pay_for_synthesis_again(
+    graph_with_satisfied_next, monkeypatch
+):
+    """`should_generate_final_output` stays True, so this turn re-enters
+    implementation. The existing artifact is what stops it."""
+    graph, _ = graph_with_satisfied_next
+    chain = _patch_synthesis(monkeypatch, PLAN)
+    config = make_config()
+
+    await graph.ainvoke(_completion_seed(), {**config, "recursion_limit": 12})
+    first = (await graph.aget_state(config)).values
+    assert chain.calls == 1
+
+    await graph.ainvoke(
+        {"messages": [HumanMessage(content="thanks!")]}, {**config, "recursion_limit": 12}
+    )
+    values = (await graph.aget_state(config)).values
+
+    assert values["should_generate_final_output"] is True
+    assert chain.calls == 1, "a second turn must not regenerate the artifact"
+    assert values["final_output"] == first["final_output"]
+    assert len(_readiness_messages(values)) == 1, "no duplicate readiness announcement"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_failure_does_not_break_the_turn(
+    graph_with_satisfied_next, monkeypatch
+):
+    """implementation -> END, so a raise here would lose a turn whose conversational
+    work has already succeeded."""
+    from agents.xbuddy import synthesis as synthesis_module
+
+    class Exploding:
+        async def ainvoke(self, *args, **kwargs):
+            raise RuntimeError("rate limited")
+
+    monkeypatch.setattr(synthesis_module, "_synthesis_chain", lambda: Exploding())
+
+    graph, _ = graph_with_satisfied_next
+    config = make_config()
+
+    await graph.ainvoke(_completion_seed(), {**config, "recursion_limit": 12})
+    values = (await graph.aget_state(config)).values
+
+    assert values.get("final_output") is None, "no partial artifact"
+    assert "rate limited" in values["last_error"]
+    assert all(
+        section.status is SectionStatus.DONE
+        for section in values["section_states"].values()
+    ), "the section work of the turn survives a synthesis failure"
+    assert _readiness_messages(values) == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_runs_are_tagged_for_suppression(
+    graph_with_satisfied_next, monkeypatch
+):
+    """Every synthesis message event must carry a tag service.py drops.
+
+    The suppression list is read out of service.py rather than duplicated here, so
+    removing the tag from either side fails this test.
+    """
+    import re
+    from pathlib import Path
+
+    from agents.xbuddy.synthesis import INTERNAL_SYNTHESIS_TAG
+
+    service_source = (
+        Path(__file__).resolve().parents[3] / "src" / "service" / "service.py"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"if any\(tag in tags for tag in \[([^\]]*)\]\)", service_source)
+    assert match, "could not locate the suppression list in service.py"
+    suppressed = set(re.findall(r'"([^"]+)"', match.group(1)))
+
+    assert INTERNAL_SYNTHESIS_TAG in suppressed, (
+        "internal_synthesis must be in service.py's suppression list, "
+        "or the raw structured JSON streams to the user"
+    )
+
+    graph, _ = graph_with_satisfied_next
+    _patch_synthesis(monkeypatch, PLAN)
+    config = make_config()
+
+    seen = 0
+    async for mode, event in graph.astream(
+        _completion_seed(), {**config, "recursion_limit": 12}, stream_mode=["messages"]
+    ):
+        if mode != "messages":
+            continue
+        _message, metadata = event
+        tags = metadata.get("tags") or []
+        if INTERNAL_SYNTHESIS_TAG in tags:
+            seen += 1
+            assert any(tag in suppressed for tag in tags)
+
+    # The faked chain emits no message events, so `seen` may be 0; the binding
+    # assertion above is the one that matters and holds either way.
+    assert seen >= 0

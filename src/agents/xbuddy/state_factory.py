@@ -47,6 +47,8 @@ COLD_DEFAULTS: dict[str, Callable[[], Any]] = {
     "last_error": lambda: None,
     # Retry queue for failed Supabase writes (memory_updater owns it).
     "persistence_pending": list,
+    # PR 5: pending durable final-output operation ("write" / "stale" / None).
+    "final_output_pending": lambda: None,
     # Final output
     "final_output": lambda: None,
     "should_generate_final_output": lambda: False,

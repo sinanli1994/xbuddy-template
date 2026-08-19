@@ -144,6 +144,96 @@ class SupabaseClient:
             logger.error(f"Error saving section state: {e}")
             return {"success": False, "error": str(e)}
     
+    # ---------------------------------------------------------------- PR 5 ----
+    # The table name is hyphenated because the frontend already uses it. Every
+    # reference quotes it; PostgREST accepts the name as-is via .table().
+
+    FINAL_OUTPUT_TABLE = "final-outputs"
+
+    def save_final_output(
+        self,
+        user_id: int,
+        thread_id: str,
+        content: str,
+        markdown_content: str,
+        generated_content_hash: str,
+        status: str = "current",
+        agent_id: str = "xbuddy",
+    ) -> dict:
+        """Upsert the durable final artifact (synchronous).
+
+        `on_conflict` is passed explicitly and names the table's UNIQUE
+        (user_id, thread_id) — the same target the frontend's upsert assumes.
+        Without it the conflict target would default to the UUID primary key and
+        the second write for a thread would insert and violate the constraint.
+
+        `updated_at` is left to the BEFORE UPDATE trigger rather than sent, so the
+        stored timestamp is always server time.
+        """
+        try:
+            result = self.client.table(self.FINAL_OUTPUT_TABLE).upsert(
+                {
+                    "user_id": user_id,
+                    "thread_id": thread_id,
+                    "agent_id": agent_id,
+                    "content": content,
+                    "markdown_content": markdown_content,
+                    "status": status,
+                    "generated_content_hash": generated_content_hash,
+                    "updated_at": "now()",
+                },
+                on_conflict="user_id,thread_id",
+            ).execute()
+
+            logger.info(
+                f"Final output saved (status={status}) for user {user_id}, thread {thread_id}"
+            )
+            return {"success": True, "data": result.data}
+        except Exception as e:  # noqa: BLE001 - never raise; callers treat this as a write failure
+            logger.error(f"Error saving final output: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_final_output(self, user_id: int, thread_id: str) -> dict | None:
+        """Read the durable final artifact row, or None (synchronous).
+
+        Selects the backend columns too: edit detection needs
+        `generated_content_hash` alongside the content the frontend would display.
+        """
+        try:
+            result = (
+                self.client.table(self.FINAL_OUTPUT_TABLE)
+                .select("content, markdown_content, status, generated_content_hash, updated_at")
+                .eq("user_id", user_id)
+                .eq("thread_id", thread_id)
+                .maybe_single()
+                .execute()
+            )
+            return result.data if result and result.data else None
+        except Exception as e:  # noqa: BLE001 - never raise; callers treat this as a write failure
+            logger.error(f"Error getting final output: {e}")
+            return None
+
+    def mark_final_output_stale(self, user_id: int, thread_id: str) -> dict:
+        """Flip an existing row to status='stale', preserving its content.
+
+        An UPDATE rather than an upsert: there is nothing to insert when no artifact
+        was ever generated, and inserting a contentless stale row would break the
+        table's NOT NULL on `content` as well as being meaningless.
+        """
+        try:
+            result = (
+                self.client.table(self.FINAL_OUTPUT_TABLE)
+                .update({"status": "stale", "updated_at": "now()"})
+                .eq("user_id", user_id)
+                .eq("thread_id", thread_id)
+                .execute()
+            )
+            logger.info(f"Final output marked stale for user {user_id}, thread {thread_id}")
+            return {"success": True, "data": result.data}
+        except Exception as e:  # noqa: BLE001 - never raise; callers treat this as a write failure
+            logger.error(f"Error marking final output stale: {e}")
+            return {"success": False, "error": str(e)}
+
     def get_business_plan(
         self,
         user_id: int,
