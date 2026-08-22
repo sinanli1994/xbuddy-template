@@ -94,8 +94,11 @@ def test_settings_is_dev():
     settings = Settings(MODE="dev", _env_file=None)
     assert settings.is_dev() is True
 
-    settings = Settings(MODE="prod", _env_file=None)
+    # PR 6 Stage 4: a production-mode Settings now requires AUTH_SECRET, so this
+    # case supplies one. The assertion is still only about is_dev().
+    settings = Settings(MODE="prod", AUTH_SECRET=SecretStr("test-secret"), _env_file=None)
     assert settings.is_dev() is False
+    assert settings.is_production() is True
 
 
 def test_settings_with_azure_openai_key():

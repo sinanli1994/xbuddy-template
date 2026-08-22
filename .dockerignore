@@ -1,0 +1,63 @@
+# Secrets — never in the build context, let alone the image.
+.env
+.env.*
+*.env
+.streamlit/secrets.toml
+**/secrets.toml
+*.pem
+*.key
+
+# VCS and CI
+.git
+.gitignore
+.github
+
+# Local virtualenvs and caches
+.venv
+venv
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Local databases and checkpoints — the deployed service uses Postgres.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.langgraph_api/
+
+# Editor / OS metadata
+.vscode
+.idea
+.cursorindexingignore
+.specstory/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Not needed at runtime
+tests/
+evals/
+frontend/
+supabase/
+docs/
+node_modules/
+build/
+dist/
+*.egg-info/
+
+# scripts/ is excluded except the two deployment diagnostics, which are meant to be
+# run inside the machine via `fly ssh console`. Docker (unlike git) honours a
+# negation that re-includes a file under an excluded glob, so `scripts/*` is used
+# rather than `scripts/`.
+scripts/*
+!scripts/fly_connectivity_probe.py
+!scripts/fly_durability_probe.py

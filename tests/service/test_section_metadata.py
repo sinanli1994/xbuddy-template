@@ -81,7 +81,8 @@ def test_no_undefined_section_symbols_remain_on_the_invoke_or_stream_path():
 
     assert "SECTION_ID_MAPPING" not in service_src
     assert "SECTION_ID_MAPPING" not in utils_src
-    # FOUNDER_BUDDY_TEMPLATES survives only in notify_section_update, which is
-    # independently broken (get_section_string_id is also undefined) and is
-    # deliberately out of PR 3 scope.
-    assert service_src.count("FOUNDER_BUDDY_TEMPLATES") == 1
+    # FOUNDER_BUDDY_TEMPLATES used to survive in notify_section_update, which was
+    # independently broken (get_section_string_id was undefined there too) and was
+    # out of PR 3 scope. PR 6 Stage 1 deleted that endpoint, so the count is now 0.
+    assert service_src.count("FOUNDER_BUDDY_TEMPLATES") == 0
+    assert "get_section_string_id" not in service_src

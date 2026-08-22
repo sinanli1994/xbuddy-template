@@ -1,0 +1,74 @@
+# Fly.io configuration for the JobBuddy API.
+#
+# Secrets live in `fly secrets set`, never here — this file is committed. See
+# docs/pr6-deployment.md for the full environment matrix.
+
+app = "jobbuddy-api"
+
+# Supabase is hosted in AWS ca-central-1.
+# Fly's Toronto (yyz) region keeps the backend geographically close to the database.
+primary_region = "yyz"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Non-secret configuration only. Anything credential-bearing belongs in
+# `fly secrets set` and would otherwise be committed to git in plain text.
+[env]
+  MODE = "production"
+  DATABASE_TYPE = "postgres"
+  PORT = "8080"
+
+  # Deliberately empty: the browser talks to the Vercel frontend, which proxies
+  # server-side to this API, so no browser origin needs allowing.
+  #
+  # Note this line is documentation rather than mechanism. Settings sets
+  # env_ignore_empty=True, so an empty value is read as *unset* and never reaches
+  # the field. The empty production result comes from the mode-aware default in
+  # `Settings.cors_allow_origins`. Setting a real origin here does take effect.
+  CORS_ALLOW_ORIGINS = ""
+  
+  LANGSMITH_TRACING = "true"
+  LANGSMITH_PROJECT = "jobbuddy-production"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  processes = ["app"]
+
+  # One machine, and it stays up.
+  #
+  # Scale-to-zero is wrong for this service on two counts: a suspended machine
+  # drops in-flight SSE connections mid-stream, and a cold start pays the full
+  # LangChain/LangGraph import cost before the first token. Staying at one
+  # machine also sidesteps the question of whether the design is
+  # multi-instance-safe, which has not been proven — slowapi's rate limiter keeps
+  # its counters in process memory, so N machines would mean N independent
+  # limits. Raising min_machines_running above 1 needs that resolved first.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    # SSE connections are long-lived, so the limit is about concurrent streams
+    # rather than request throughput.
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+  [[http_service.checks]]
+    path = "/health"
+    protocol = "http"
+    method = "GET"
+    interval = "30s"
+    timeout = "5s"
+    # The image imports LangChain, LangGraph and several provider SDKs before it
+    # serves anything; a short grace period would kill the machine mid-boot.
+    grace_period = "30s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# No [mounts] section, deliberately. All persistence is in Supabase Postgres, so
+# a volume would only create machine-local state that a redeploy silently loses.

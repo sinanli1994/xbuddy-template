@@ -163,7 +163,7 @@ class ChatMessage(BaseModel):
         return f"{title}\n\n{self.content}"
 
     def pretty_print(self) -> None:
-        print(self.pretty_repr())  # noqa: T201
+        print(self.pretty_repr())
 
 
 class Feedback(BaseModel):  # type: ignore[no-redef]
@@ -193,20 +193,104 @@ class FeedbackResponse(BaseModel):
 
 
 class ChatHistoryInput(BaseModel):
-    """Input for retrieving chat history."""
+    """Input for retrieving chat history.
+
+    Both identifiers are required. `thread_id` selects the checkpoint; `user_id`
+    scopes the read, so a caller cannot page through other people's threads by
+    guessing ids. This is a deliberate breaking change to the previous
+    thread-id-only request: the old shape had no scoping at all.
+    """
 
     thread_id: str = Field(
         description="Thread ID to persist and continue a multi-turn conversation.",
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
+    user_id: int = Field(
+        description="User the thread must belong to. Required; the read is scoped to it.",
+        examples=[1, 123],
+    )
 
 
 class ChatHistory(BaseModel):
-    messages: list[ChatMessage]
+    """Conversation messages for one thread.
+
+    Messages only. No `user_data`, no `section_states`, no `final_output`, no
+    router directives, no persistence flags, no `finished` — a history reader needs
+    the transcript, not the graph. Progress and completion are the job of
+    `/invoke`'s `CompletionState` projection.
+
+    `thread_id` and `user_id` are echoed so a client can correlate a response with
+    the request that produced it.
+    """
+
+    thread_id: str = Field(
+        description="The thread these messages belong to.",
+        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
+    )
+    user_id: int = Field(
+        description="The user the thread belongs to.",
+        examples=[1, 123],
+    )
+    messages: list[ChatMessage] = Field(
+        description="The conversation, oldest first.",
+    )
 
 
-class InvokeResponse(BaseModel):
-    """Response from an agent invocation."""
+class PublicSection(BaseModel):
+    """One section, as the outside world sees it.
+
+    Exactly three fields. No `database_id` (a FounderBuddy UI position), no draft
+    content, no satisfaction flags — a public client needs to render progress, not
+    inspect graph state.
+    """
+
+    id: str = Field(
+        description="Canonical section identifier.",
+        examples=["career_goal", "action_plan"],
+    )
+    name: str = Field(
+        description="Human-readable section name.",
+        examples=["Career Goal", "Action Plan"],
+    )
+    status: str = Field(
+        description="One of pending, in_progress, done.",
+        examples=["pending", "in_progress", "done"],
+    )
+
+
+class CompletionState(BaseModel):
+    """The narrow public completion projection.
+
+    Two independent booleans, because they answer different questions and can
+    legitimately disagree — a completed conversation whose synthesis failed is
+    `collection_complete=True, artifact_available=False`.
+
+    `finished` is deliberately **not** exposed. It is router-owned and
+    directive-gated (see Issue #10): a thread with every section done can sit at
+    `finished=False` indefinitely if the decision model keeps returning `stay`.
+    Publishing it would promote a latent bug into a public contract.
+    """
+
+    collection_complete: bool = Field(
+        description=(
+            "Every one of the five sections is done. Derived from the agent's "
+            "should_generate_final_output, which is computed from section statuses."
+        ),
+    )
+    artifact_available: bool = Field(
+        description="A final artifact exists for this thread.",
+    )
+    sections: list[PublicSection] = Field(
+        description="All five sections in canonical order.",
+    )
+
+
+class InvokeResponse(CompletionState):
+    """Response from an agent invocation.
+
+    Inherits the completion projection, so `output`/`thread_id`/`user_id` keep
+    their existing meaning and shape and the three new keys are purely additive.
+    """
 
     output: ChatMessage = Field(
         description="The output of the agent.",

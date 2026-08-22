@@ -8,13 +8,17 @@ setup_logging()
 import time
 import warnings
 from collections.abc import AsyncGenerator
+import secrets
 from contextlib import asynccontextmanager
+from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_core._api import LangChainBetaWarning
@@ -28,6 +32,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info
 from agents.xbuddy import initialize_xbuddy_state
+from agents.xbuddy.enums import SectionID
 from agents.xbuddy.prompts import SECTION_TEMPLATES
 from core import settings
 from core.settings import DatabaseType
@@ -39,8 +44,9 @@ from schema import (
     ChatMessage,
     Feedback,
     FeedbackResponse,
+    CompletionState,
     InvokeResponse,
-    RefineSectionInput,
+    PublicSection,
     ServiceMetadata,
     StreamInput,
     UserInput,
@@ -169,9 +175,18 @@ def verify_bearer(
     ],
 ) -> None:
     if not settings.AUTH_SECRET:
+        # Local development convenience. A deployed process cannot reach this
+        # branch: Settings refuses to construct when MODE is production and
+        # AUTH_SECRET is unset, so the service fails to start rather than serving
+        # an unprotected API.
         return
     auth_secret = settings.AUTH_SECRET.get_secret_value()
-    if not http_auth or http_auth.credentials != auth_secret:
+    if not http_auth:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    # Constant-time comparison: `!=` on secrets leaks length and prefix through
+    # timing. The value is never logged — RequestLoggingMiddleware masks the
+    # Authorization header, and no error message echoes the credential.
+    if not secrets.compare_digest(http_auth.credentials, auth_secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
@@ -242,13 +257,54 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("✅ Realtime worker stopped")
 
 
-app = FastAPI(lifespan=lifespan)
+def client_ip_key(request: Request) -> str:
+    """The rate-limit bucket for one request. Pure, so it is directly testable.
 
-# Add CORS middleware to allow frontend requests
+    Order is deliberate:
+
+    1. **`Fly-Client-IP`** — set by Fly's edge and not forwardable by a caller, so
+       it is the one proxy header this service trusts.
+    2. **`request.client.host`** — the direct peer, used locally and in tests.
+
+    `X-Forwarded-For` is **never** consulted. Any client can send it, so trusting
+    it would let a caller mint a fresh bucket per request and bypass the limit
+    entirely — worse than having no limit, because it would look like one.
+
+    Caveat this cannot fix: when the browser talks to a Vercel server-side proxy
+    which then calls this API, Fly sees the *proxy* as the client, so all users
+    behind it share one bucket. That makes this cost and abuse protection for a
+    demo, not a per-user quota. Real quotas need an authenticated identity and
+    shared state, both deliberately out of scope for PR 6.
+    """
+    fly_client_ip = request.headers.get("Fly-Client-IP")
+    if fly_client_ip and fly_client_ip.strip():
+        return fly_client_ip.strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+# Applied only to the two expensive LLM entrypoints. /history is a cheap
+# checkpoint read and is deliberately unthrottled in PR 6.
+limiter = Limiter(key_func=client_ip_key)
+
+app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS is an explicit, environment-driven allowlist. `["*"]` is gone: combined with
+# allow_credentials it is also invalid per the CORS spec, and it let any page on the
+# internet call this API from a browser.
+#
+# allow_credentials is False. Nothing here uses cookies or browser credentials —
+# authentication is a bearer token the frontend attaches server-side, and the
+# frontend reaches this API through its own Next.js route handlers rather than from
+# the browser. Leaving it True would also forbid ever using a wildcard origin, and
+# would imply a credential flow that does not exist.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins like ["https://xbuddy.vercel.app"]
-    allow_credentials=True,
+    allow_origins=settings.cors_allow_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -261,40 +317,105 @@ router = APIRouter(dependencies=[Depends(verify_bearer)])
 
 @router.get("/info")
 async def info() -> ServiceMetadata:
-    from schema import EndpointInfo
-
     return ServiceMetadata(
         agents=get_all_agent_info(),
         models=[],  # Models are server-managed, not user-selectable
         default_agent=DEFAULT_AGENT,
         default_model=None,  # Model selection is server-internal
         endpoints=[
-            EndpointInfo(
-                path="/sync_section/{agent_id}/{section_id}",
-                method="POST",
-                description="Sync LangGraph state with manually edited section content from database. Uses LLM to extract structured data from Tiptap text and updates agent state. Common section IDs: 45=interview, 46=icp, 48=pain, 49=deep_fear, 50=payoffs, 52=signature_method, 53=mistakes, 54=prize.",
-                parameters={
-                    "agent_id": "Agent identifier (currently only 'xbuddy' supported)",
-                    "section_id": "Section ID integer from database (e.g., 48 for pain, 46 for icp, 45 for interview)",
-                    "user_id": "User identifier (required query parameter)",
-                    "thread_id": "Thread/conversation identifier (required query parameter)"
-                },
-                example="/sync_section/xbuddy/48?user_id=12&thread_id=3ab280c6-44ee-416d-87f9-73aad616c8ec"
-            ),
-            EndpointInfo(
-                path="/refine_section/{agent_id}/{section_id}",
-                method="POST",
-                description="Refine section content using AI. Accepts JSON body with user_id, thread_id, and refinement_prompt. Returns refined content (plain text + Tiptap format). Does NOT save to database. Common section IDs: 45=interview, 46=icp, 48=pain, 49=deep_fear, 50=payoffs, 52=signature_method, 53=mistakes, 54=prize.",
-                parameters={
-                    "agent_id": "Agent identifier - path parameter (currently only 'xbuddy' supported)",
-                    "section_id": "Section ID integer from database - path parameter (e.g., 48 for pain, 46 for icp, 45 for interview)",
-                    "body.user_id": "User identifier (integer, required in JSON body)",
-                    "body.thread_id": "Thread/conversation identifier (string, required in JSON body)",
-                    "body.refinement_prompt": "User's refinement instruction (string, can be long text, required in JSON body)"
-                },
-                example='curl -X POST http://localhost:8080/refine_section/xbuddy/48 -H "Content-Type: application/json" -d \'{"user_id": 12, "thread_id": "3ab280c6-44ee-416d-87f9-73aad616c8ec", "refinement_prompt": "Make it more concise"}\''
-            ),
+            # Only routes that are actually registered. The handlers for
+            # /sync_section and /refine_section were deleted in PR 6, but their
+            # EndpointInfo entries stayed behind, so /info advertised an API that
+            # answers 404 to anyone who believed it.
         ]
+    )
+
+
+def enum_value(value: Any) -> str:
+    """Normalize an enum-like checkpoint value to its public string form.
+
+        Enum -> .value
+        str  -> unchanged
+
+    A checkpoint restore does not guarantee which one you get. The domain layer already
+    assumes both — `router_node` does `SectionID(state.get("current_section"))`, and
+    `coerce_section_state` exists precisely because "deserialized checkpoints can hand
+    back plain dicts". The service boundary assumed the typed form, and a live thread
+    returned 500 with `'str' object has no attribute 'value'`.
+
+    Anything else raises. A `str(value)` fallback would turn a real bug into a
+    plausible-looking string and ship it to the frontend, which is how this class of
+    error stays hidden.
+    """
+    if isinstance(value, Enum):
+        return str(value.value)
+    if isinstance(value, str):
+        return value
+    raise TypeError(
+        f"expected an Enum or str at the public boundary, got {type(value).__name__}"
+    )
+
+
+def section_status(entry: Any) -> str:
+    """The public status string for one checkpoint-restored section entry.
+
+    The entry may be a `SectionState` or the plain dict it deserializes to, and its
+    `status` may be a `SectionStatus` or a bare string. A missing section reads as
+    `pending`, matching `public_completion`'s contract that the array is always five
+    long.
+    """
+    if entry is None:
+        return "pending"
+    status = getattr(entry, "status", None)
+    if status is None and isinstance(entry, dict):
+        status = entry.get("status")
+    if status is None:
+        return "pending"
+    return enum_value(status)
+
+
+def public_completion(state_values: dict[str, Any]) -> CompletionState:
+    """Project graph state onto the narrow public completion contract.
+
+    The single source for both `/invoke` and the SSE `completion` event, so the two
+    surfaces cannot drift.
+
+    Three fields, each derived from exactly one internal signal:
+
+    * `collection_complete` <- `should_generate_final_output`, which memory_updater
+      computes from section statuses alone. Not `finished`: that is router-owned and
+      only set when the router observes a `next` directive with nothing unfinished,
+      so it can stay False indefinitely on a completed thread (Issue #10).
+    * `artifact_available` <- `final_output is not None`. The same signal
+      implementation_node uses as its once-only guard.
+    * `sections` <- all five in canonical `SectionID` order, projected to
+      `{id, name, status}` only.
+
+    Nothing else crosses the boundary: no `finished`, no `user_data`, no draft
+    content, no satisfaction flags, no `database_id`. A section absent from state is
+    reported as `pending` rather than omitted, so the array is always five long and
+    a client can render progress without knowing the schema.
+    """
+    raw_sections = state_values.get("section_states") or {}
+
+    sections: list[PublicSection] = []
+    for section_id in SectionID:
+        entry = raw_sections.get(section_id.value)
+        status_value = section_status(entry)
+
+        template = SECTION_TEMPLATES.get(section_id.value)
+        sections.append(
+            PublicSection(
+                id=section_id.value,
+                name=template.name if template else section_id.value,
+                status=str(status_value),
+            )
+        )
+
+    return CompletionState(
+        collection_complete=bool(state_values.get("should_generate_final_output", False)),
+        artifact_available=state_values.get("final_output") is not None,
+        sections=sections,
     )
 
 
@@ -412,7 +533,10 @@ async def _handle_input(user_input: UserInput, agent: AgentGraph, agent_id: str)
 
 @router.post("/{agent_id}/invoke")
 @router.post("/invoke")
-async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> InvokeResponse:
+@limiter.limit(settings.RATE_LIMIT_EXPENSIVE)
+async def invoke(
+    request: Request, user_input: UserInput, agent_id: str = DEFAULT_AGENT
+) -> InvokeResponse:
     """
     Invoke an agent with user input to retrieve a final response.
 
@@ -479,7 +603,7 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> Invoke
         state = await agent.aget_state(config=kwargs["config"])
         if "current_section" in state.values:
             current_section_enum = state.values["current_section"]
-            current_section_id = current_section_enum.value  # Use the string value
+            current_section_id = enum_value(current_section_enum)
             section_state = state.values.get("section_states", {}).get(current_section_id)
             # Choose the right section templates based on agent_id
             if agent_id == "xbuddy":
@@ -492,14 +616,20 @@ async def invoke(user_input: UserInput, agent_id: str = DEFAULT_AGENT) -> Invoke
             section_data = {
                 "database_id": _SECTION_DISPLAY_POSITION.get(current_section_id),
                 "name": section_template.name if section_template else "Unknown Section",
-                "status": section_state.status.value if section_state else "pending",
+                "status": section_status(section_state),
             }
             output.custom_data["section"] = section_data
 
+        # `state` was already read above for the active-section metadata; the
+        # same snapshot is the authoritative source for the completion fields.
+        completion = public_completion(state.values or {})
         invoke_response = InvokeResponse(
             output=output,
             thread_id=kwargs["config"]["configurable"]["thread_id"],
             user_id=kwargs["config"]["configurable"]["user_id"],
+            collection_complete=completion.collection_complete,
+            artifact_available=completion.artifact_available,
+            sections=completion.sections,
         )
         
         # Log successful response
@@ -562,6 +692,9 @@ async def message_generator(
 
     sent_message_count = 0  # Track the number of messages sent to prevent duplicates
 
+    # Distinguishes a clean finish from the error path; the completion event is
+    # emitted only on the former.
+    stream_completed_cleanly = False
     try:
         # Send metadata as the first event in the stream
         thread_id = kwargs["config"]["configurable"]["thread_id"]
@@ -628,48 +761,6 @@ async def message_generator(
                     if key in ['tool_calls', 'additional_kwargs', 'invalid_tool_calls']:
                         logger.debug(f"Skipping function call tuple: {key}")
                         continue
-                    # Skip internal extraction field names that might leak from structured output
-                    # These are field names from our data models that shouldn't appear in user stream
-                    extraction_fields = [
-                        # Interview fields
-                        'client_name', 'company_name', 'preferred_name', 'industry', 'specialty', 
-                        'career_highlight', 'client_outcomes', 'specialized_skills', 'awards_media',
-                        'published_content', 'notable_partners',
-                        # ICP fields
-                        'icp_nickname', 'icp_role_identity', 'icp_context_scale', 'icp_industry_sector_context',
-                        'icp_demographics', 'icp_interests', 'icp_values', 'icp_golden_insight',
-                        # Pain fields
-                        'pain1_symptom', 'pain1_struggle', 'pain1_cost', 'pain1_consequence',
-                        'pain2_symptom', 'pain2_struggle', 'pain2_cost', 'pain2_consequence',
-                        'pain3_symptom', 'pain3_struggle', 'pain3_cost', 'pain3_consequence',
-                        # Deep Fear fields
-                        'deep_fear', 'golden_insight',
-                        # Payoffs fields
-                        'payoff1_objective', 'payoff1_desire', 'payoff1_without', 'payoff1_resolution',
-                        'payoff2_objective', 'payoff2_desire', 'payoff2_without', 'payoff2_resolution',
-                        'payoff3_objective', 'payoff3_desire', 'payoff3_without', 'payoff3_resolution',
-                        # Signature Method fields
-                        'method_name', 'sequenced_principles', 'principle_descriptions', 'principles',
-                        # Mistakes fields
-                        'mistakes',
-                        # Prize fields
-                        'prize_statement', 'prize_category', 'refined_prize',
-                        # Social Pitch fields - NAME
-                        'user_name', 'user_position',
-                        # Social Pitch fields - SAME
-                        'business_category', 'target_customer', 'same_statement',
-                        # Social Pitch fields - FAME
-                        'fame_tier', 'fame_statement', 'achievement_details',
-                        # Social Pitch fields - PAIN
-                        'ideal_clients', 'broad_challenge', 'pain_statement',
-                        # Social Pitch fields - AIM
-                        'current_project_category', 'project_description', 'aim_statement',
-                        # Social Pitch fields - GAME
-                        'vision_approach', 'bigger_vision', 'game_statement',
-                    ]
-                    if key in extraction_fields:
-                        logger.debug(f"Skipping internal extraction field: {key}")
-                        continue
                     # Store parts in temporary dict
                     logger.debug(f"Processing tuple: {key}")
                     current_message[key] = value
@@ -699,45 +790,6 @@ async def message_generator(
                             logger.info(f"🚫 SKIPPING internal tool_call message: {repr(message)}")
                             continue
                     
-                    # Skip messages that appear to be internal data extraction results
-                    # These might have content but are from structured output calls
-                    if isinstance(message, AIMessage) and message.content:
-                        # Check if content looks like field names or extracted data
-                        content_lower = message.content.lower() if isinstance(message.content, str) else ""
-                        extraction_fields = [
-                            # Interview fields
-                            'client_name', 'company_name', 'preferred_name', 'industry', 'specialty', 
-                            'career_highlight', 'client_outcomes', 'specialized_skills', 'awards_media',
-                            'published_content', 'notable_partners',
-                            # ICP fields
-                            'icp_nickname', 'icp_role_identity', 'icp_context_scale', 'icp_industry_sector_context',
-                            'icp_demographics', 'icp_interests', 'icp_values', 'icp_golden_insight',
-                            # Pain fields
-                            'pain1_symptom', 'pain1_struggle', 'pain1_cost', 'pain1_consequence',
-                            'pain2_symptom', 'pain2_struggle', 'pain2_cost', 'pain2_consequence',
-                            'pain3_symptom', 'pain3_struggle', 'pain3_cost', 'pain3_consequence',
-                            # Deep Fear fields
-                            'deep_fear', 'golden_insight',
-                            # Payoffs fields
-                            'payoff1_objective', 'payoff1_desire', 'payoff1_without', 'payoff1_resolution',
-                            'payoff2_objective', 'payoff2_desire', 'payoff2_without', 'payoff2_resolution',
-                            'payoff3_objective', 'payoff3_desire', 'payoff3_without', 'payoff3_resolution',
-                            # Signature Method fields
-                            'method_name', 'sequenced_principles', 'principle_descriptions', 'principles',
-                            # Mistakes fields
-                            'mistakes',
-                            # Prize fields
-                            'prize_statement', 'prize_category', 'refined_prize',
-                            # Social Pitch fields
-                            'user_name', 'user_position', 'business_category', 'target_customer', 
-                            'same_statement', 'fame_tier', 'fame_statement', 'achievement_details',
-                            'ideal_clients', 'broad_challenge', 'pain_statement', 'current_project_category',
-                            'project_description', 'aim_statement', 'vision_approach', 'bigger_vision', 'game_statement',
-                        ]
-                        if any(field in content_lower for field in extraction_fields):
-                            logger.debug(f"Skipping potential extraction data message: {message.content[:50]}...")
-                            continue
-
                     logger.info(f"🔧 CONVERTING message type: {type(message).__name__}")
                     chat_message = langchain_to_chat_message(message)
                     logger.info(f"✅ CONVERSION SUCCESS for {type(message).__name__}")
@@ -771,6 +823,11 @@ async def message_generator(
                     # that the model is asking for a tool to be invoked.
                     # So we only print non-empty content.
                     yield f"data: {json.dumps({'type': 'token', 'content': convert_message_content_to_string(content)})}\n\n"
+        # Reached only when the LangGraph stream finished without raising. The
+        # finally block emits a completion event only in that case; an errored
+        # stream keeps its existing error -> [DONE] shape with nothing synthetic
+        # appended.
+        stream_completed_cleanly = True
     except Exception as e:
         import traceback
         logger.error(f"[STREAM ERROR] {str(e)} (run_id={run_id}, agent={agent_id})")
@@ -782,31 +839,19 @@ async def message_generator(
             state = await agent.aget_state(config=kwargs["config"])
             if "current_section" in state.values:
                 current_section_enum = state.values["current_section"]
-                current_section_id = current_section_enum.value  # Use the string value
+                current_section_id = enum_value(current_section_enum)
                 section_state = state.values.get("section_states", {}).get(current_section_id)
                 
-                # Choose the right section templates based on agent_id
-                if agent_id == "mission-pitch":
-                    section_templates = MISSION_PITCH_TEMPLATES
-                elif agent_id == "social-pitch":
-                    section_templates = SOCIAL_PITCH_TEMPLATES
-                elif agent_id == "signature-pitch":
-                    section_templates = SIGNATURE_PITCH_TEMPLATES
-                elif agent_id == "special-report":
-                    section_templates = SPECIAL_REPORT_TEMPLATES
-                elif agent_id == "concept-pitch":
-                    section_templates = CONCEPT_PITCH_TEMPLATES
-                elif agent_id == "xbuddy":
-                    section_templates = SECTION_TEMPLATES
-                else:  # default to value_canvas
-                    section_templates = VALUE_CANVAS_TEMPLATES
+                # JobBuddy is the only agent this service serves; the removed
+                # branches referenced six undefined *_TEMPLATES names.
+                section_templates = SECTION_TEMPLATES
 
                 section_template = section_templates.get(current_section_id)
 
                 section_data = {
                     "database_id": _SECTION_DISPLAY_POSITION.get(current_section_id),
                     "name": section_template.name if section_template else "Unknown Section",
-                    "status": section_state.status.value if section_state else "pending",
+                    "status": section_status(section_state),
                 }
                 yield f"data: {json.dumps({'type': 'section', 'content': section_data})}\n\n"
         except Exception as e:
@@ -815,6 +860,20 @@ async def message_generator(
         # Log stream completion
         logger.info(f"[STREAM] Complete: agent={agent_id}, thread={kwargs['config']['configurable']['thread_id'][:8]}...")
         
+        # One terminal structured event, immediately before [DONE], and only on a
+        # clean finish. Read through the async state API so it reflects everything
+        # the turn committed — including an artifact implementation_node wrote in
+        # this same turn, which the pre-stream snapshot could not see.
+        if stream_completed_cleanly:
+            try:
+                final_state = await agent.aget_state(config=kwargs["config"])
+                completion = public_completion(final_state.values or {})
+                yield f"data: {json.dumps({'type': 'completion', 'content': completion.model_dump()})}\n\n"
+            except Exception as e:  # noqa: BLE001 - a completion read failure must not
+                # turn a successful turn into a failed one; the client still gets its
+                # messages and [DONE].
+                logger.error(f"Error building completion event: {e}")
+
         yield "data: [DONE]\n\n"
 
 
@@ -848,7 +907,10 @@ def _sse_response_example() -> dict[int | str, Any]:
     responses=_sse_response_example(),
 )
 @router.post("/stream", response_class=StreamingResponse, responses=_sse_response_example())
-async def stream(user_input: StreamInput, agent_id: str = DEFAULT_AGENT, request: Request = None) -> StreamingResponse:
+@limiter.limit(settings.RATE_LIMIT_EXPENSIVE)
+async def stream(
+    request: Request, user_input: StreamInput, agent_id: str = DEFAULT_AGENT
+) -> StreamingResponse:
     """
     Stream an agent's response to a user input, including intermediate messages and tokens.
 
@@ -898,161 +960,90 @@ async def feedback(feedback: Feedback) -> FeedbackResponse:
         raise
 
 
-@router.post("/history")
-def history(input: ChatHistoryInput) -> ChatHistory:
-    """
-    Get chat history.
-    """
-    # Log history request
-    logger.info(f"=== HISTORY_REQUEST: thread_id={input.thread_id} ===")
+async def load_chat_history(agent_id: str, thread_id: str, user_id: int) -> ChatHistory:
+    """Read one thread's transcript from the checkpointer, scoped to its owner.
 
-    # TODO: Hard-coding DEFAULT_AGENT here is wonky
-    agent: AgentGraph = get_agent(DEFAULT_AGENT)
+    Shared by every `/history` route so the default-agent and explicit-agent forms
+    cannot diverge; `agent_id` is a parameter rather than a hardcoded DEFAULT_AGENT.
+
+    **Async on purpose.** The previous implementation called the synchronous
+    `agent.get_state`, which is the wrong API for the savers this service actually
+    configures — `AsyncSqliteSaver` locally and `AsyncPostgresSaver` in production.
+    `aget_state` is the one path that works against both.
+
+    **Scoping, and why 404 rather than 403.** A thread whose stored `user_id`
+    differs from the requested one is reported as not found. 403 would confirm the
+    thread exists while refusing it, which tells an unauthorised caller strictly
+    more than 404 does. The cost is usability: a client that sends the wrong
+    `user_id` for its own thread sees "not found" rather than "wrong user", which is
+    harder to debug.
+
+    Honest limitation for this demo: authorization is a **single shared bearer
+    token**, so every caller holding it is equally trusted and `user_id` is
+    self-asserted rather than proven. This check prevents accidental cross-thread
+    reads and gives per-user auth somewhere to plug in later; it is not an identity
+    boundary. Note also that a nonexistent thread returns 200 with an empty list
+    while a non-owned one returns 404, so a token holder can still distinguish the
+    two. Closing that gap needs real identity, which is deliberately out of scope
+    here.
+    """
     try:
-        state_snapshot = agent.get_state(
-            config=RunnableConfig(configurable={"thread_id": input.thread_id})
+        agent: AgentGraph = get_agent(agent_id)
+    except KeyError as exc:
+        logger.warning(f"HISTORY_UNKNOWN_AGENT: agent_id={agent_id}")
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id}") from exc
+
+    try:
+        # Same thread configuration convention as /invoke and /stream.
+        state_snapshot = await agent.aget_state(
+            config=RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
         )
-
-        # Check if state exists and has messages
-        if not state_snapshot.values:
-            logger.warning(f"HISTORY_WARNING: No state found for thread_id={input.thread_id}")
-            return ChatHistory(messages=[])
-
-        messages: list[AnyMessage] = state_snapshot.values.get("messages", [])
-        chat_messages: list[ChatMessage] = [langchain_to_chat_message(m) for m in messages]
-
-        # Log successful history response
-        logger.info(f"=== HISTORY_SUCCESS: thread_id={input.thread_id} ===")
-        logger.info(f"HISTORY_SUCCESS: message_count={len(chat_messages)}")
-
-        return ChatHistory(messages=chat_messages)
     except Exception as e:
-        logger.error(f"=== HISTORY_ERROR: thread_id={input.thread_id} ===")
+        logger.error(f"=== HISTORY_ERROR: thread_id={thread_id} ===")
         logger.error(f"HISTORY_ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="Unexpected error")
+        raise HTTPException(status_code=500, detail="Unexpected error") from e
+
+    values = state_snapshot.values or {}
+    if not values:
+        # Preserves the previous behaviour for an unknown or brand-new thread.
+        logger.warning(f"HISTORY_WARNING: No state found for thread_id={thread_id}")
+        return ChatHistory(thread_id=thread_id, user_id=user_id, messages=[])
+
+    # Deny by default: a checkpoint without a stored user_id cannot be shown to
+    # anyone, because ownership cannot be established. initialize_node always
+    # writes it, so this only fires on a checkpoint written by something else.
+    owner_id = values.get("user_id")
+    if owner_id != user_id:
+        logger.warning(
+            f"HISTORY_SCOPE_MISMATCH: thread_id={thread_id} requested_by={user_id}"
+        )
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    messages: list[AnyMessage] = values.get("messages", [])
+    chat_messages: list[ChatMessage] = [langchain_to_chat_message(m) for m in messages]
+
+    logger.info(f"=== HISTORY_SUCCESS: thread_id={thread_id} ===")
+    logger.info(f"HISTORY_SUCCESS: message_count={len(chat_messages)}")
+
+    return ChatHistory(thread_id=thread_id, user_id=user_id, messages=chat_messages)
 
 
-@router.get("/section_states/{agent_id}/{section_id}")
-async def notify_section_update(
-    agent_id: str,
-    section_id: int,
-    user_id: int,
-    thread_id: str | None = None,
-):
+@router.post("/{agent_id}/history")
+@router.post("/history")
+async def history(input: ChatHistoryInput, agent_id: str = DEFAULT_AGENT) -> ChatHistory:
+    """Get the conversation transcript for one thread.
+
+    REST, not streaming: a history read has no incremental value, and the client
+    wants the whole transcript at once.
+
+    Two route forms, matching /invoke and /stream: the bare path uses the default
+    agent, the prefixed path names one explicitly.
     """
-    Notify agent that a section has been edited and trigger a minimal sync run.
-
-    This endpoint always:
-    - Triggers a minimal Agent run to reload latest content for the section
-    - Returns an AI prompt (single message) and the latest section status/draft
-
-    Args:
-        agent_id: Agent identifier (e.g., "xbuddy")
-        section_id: Section ID integer from database (e.g., 48 for pain, 46 for icp)
-        user_id: User identifier
-        thread_id: Thread/conversation identifier (required)
-    """
-    # Log section update request
-    logger.info(f"=== SECTION_UPDATE_REQUEST: agent_id={agent_id}, section_id={section_id} ===")
-    logger.info(f"SECTION_UPDATE_REQUEST: user_id={user_id}")
-    logger.info(f"SECTION_UPDATE_REQUEST: thread_id={thread_id}")
-
-    # Convert section_id integer to string identifier for internal use
-    section_id_str = get_section_string_id(section_id)
-    if not section_id_str:
-        raise HTTPException(status_code=422, detail=f"Invalid section_id: {section_id}")
-
-    # Require thread_id to ensure updates are scoped to the correct document/thread
-    if not thread_id:
-        raise HTTPException(status_code=422, detail="Missing required parameter: thread_id")
-    
-    # Choose the right section templates based on agent_id
-    if agent_id == "xbuddy":
-        section_templates = FOUNDER_BUDDY_TEMPLATES
-    else:
-        raise ValueError(f"Unknown agent: {agent_id}")
-    
-    # Validate section_id
-    if section_id_str not in section_templates:
-        raise HTTPException(status_code=422, detail=f"Unknown section_id: {section_id}")
-
-    # Trigger a minimal graph run to refresh context
-    agent: AgentGraph = get_agent(agent_id)
-    notify_msg = (
-        f"I just updated section '{section_id_str}' in the UI. "
-        f"Please reload the latest content from the database for this section, "
-        f"then ask me whether to continue to the next step or refine this section."
+    logger.info(
+        f"=== HISTORY_REQUEST: agent_id={agent_id} thread_id={input.thread_id} "
+        f"user_id={input.user_id} ==="
     )
-    user_input = UserInput(message=notify_msg, user_id=user_id, thread_id=thread_id)
-    kwargs, run_id = await _handle_input(user_input, agent, agent_id)
-
-    # Execute once; ignore content and return minimal success
-    try:
-        await agent.ainvoke(**kwargs, stream_mode=["updates", "values"])  # type: ignore
-
-        # Log successful section update
-        logger.info(f"=== SECTION_UPDATE_SUCCESS: agent_id={agent_id}, section_id={section_id} (string_id={section_id_str}) ===")
-        logger.info(f"SECTION_UPDATE_SUCCESS: user_id={user_id}")
-        logger.info(f"SECTION_UPDATE_SUCCESS: thread_id={thread_id}")
-
-    except Exception as e:
-        logger.error(f"=== SECTION_UPDATE_ERROR: agent_id={agent_id}, section_id={section_id} ===")
-        logger.error(f"SECTION_UPDATE_ERROR: {str(e)}")
-        logger.error(f"SECTION_UPDATE_ERROR: user_id={user_id}")
-        logger.error(f"SECTION_UPDATE_ERROR: thread_id={thread_id}")
-        raise HTTPException(status_code=500, detail="Agent sync failed")
-
-    return {"success": True}
-
-
-@router.post("/sync_section/{agent_id}/{section_id}")
-async def sync_section(
-    agent_id: str,
-    section_id: int,
-    user_id: int,
-    thread_id: str,
-):
-    """
-    Sync LangGraph state with manually edited section content from database.
-
-    This endpoint:
-    1. Fetches the latest section content from # DentApp (removed) API (Tiptap format)
-    2. Converts Tiptap to plain text
-    3. Uses LLM to extract structured data from the edited text
-    4. Updates LangGraph state (canvas_data + section_states)
-    5. Persists changes via checkpoint
-
-    This is designed for when users manually edit section content in the frontend
-    and we need to sync the structured state with their changes.
-
-    Args:
-        agent_id: Agent identifier (e.g., "xbuddy")
-        section_id: Section ID integer from database (e.g., 48 for pain, 46 for icp)
-        user_id: User identifier
-        thread_id: Thread/conversation identifier
-
-    Returns:
-        Sync result with success status and details
-    """
-    # Log sync request
-    logger.info(f"=== SYNC_SECTION_REQUEST: agent_id={agent_id}, section_id={section_id} ===")
-    logger.info(f"SYNC_SECTION_REQUEST: user_id={user_id}")
-    logger.info(f"SYNC_SECTION_REQUEST: thread_id={thread_id}")
-
-    # Convert section_id integer to string identifier for internal use
-    section_id_str = get_section_string_id(section_id)
-    if not section_id_str:
-        raise HTTPException(status_code=422, detail=f"Invalid section_id: {section_id}")
-
-    # Validate required parameters
-    if not thread_id:
-        raise HTTPException(status_code=422, detail="Missing required parameter: thread_id")
-
-    # Sync is not supported for xbuddy agent
-    raise HTTPException(
-        status_code=422,
-        detail=f"Sync not supported for agent: {agent_id}. This feature is not available for xbuddy."
-    )
+    return await load_chat_history(agent_id, input.thread_id, input.user_id)
 
 
 @router.get("/check_agent_state/{agent_id}")
@@ -1493,116 +1484,6 @@ async def get_agent_state(
         logger.error(f"Error getting agent state: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting agent state: {str(e)}")
 
-    # Execute sync
-    try:
-        result = await sync_section_from_database(
-            user_id=user_id,
-            thread_id=thread_id,
-            section_id=section_id_str,
-            agent_graph=agent
-        )
-
-        # Log successful sync
-        logger.info(f"=== SYNC_SECTION_SUCCESS: agent_id={agent_id}, section_id={section_id} (string_id={section_id_str}) ===")
-        logger.info(f"SYNC_SECTION_SUCCESS: extracted_fields={result.get('extracted_fields', [])}")
-        logger.info(f"SYNC_SECTION_SUCCESS: content_length={result.get('content_length', 0)}")
-
-        return result
-
-    except ValueError as e:
-        logger.error(f"=== SYNC_SECTION_VALIDATION_ERROR: {str(e)} ===")
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"=== SYNC_SECTION_ERROR: agent_id={agent_id}, section_id={section_id} ===")
-        logger.error(f"SYNC_SECTION_ERROR: {str(e)}")
-        logger.error(f"SYNC_SECTION_ERROR: user_id={user_id}")
-        logger.error(f"SYNC_SECTION_ERROR: thread_id={thread_id}")
-        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
-
-
-@router.post("/refine_section/{agent_id}/{section_id}")
-async def refine_section(
-    agent_id: str,
-    section_id: int,
-    request: RefineSectionInput,
-):
-    """
-    Refine section content using AI based on user's instruction.
-
-    This endpoint:
-    1. Fetches current LangGraph state to get canvas_data
-    2. Gets rendered section prompt with all dependencies
-    3. Fetches current section content from # DentApp (removed) API
-    4. Constructs refinement prompt with clear structure
-    5. Calls OpenAI LLM to generate refined content
-    6. Returns refined content (does NOT save to database)
-
-    Frontend workflow:
-    1. User clicks "Refine" button
-    2. Frontend calls this endpoint
-    3. Refined content is displayed for user review
-    4. If user accepts, frontend saves to # DentApp (removed) API and calls /sync_section
-
-    Args:
-        agent_id: Agent identifier (e.g., "xbuddy") - path parameter
-        section_id: Section ID integer from database (e.g., 48 for pain, 46 for icp) - path parameter
-        request: Request body containing user_id, thread_id, and refinement_prompt
-
-    Returns:
-        Refinement result with refined content in both plain text and Tiptap format
-    """
-    # Extract parameters from request body
-    user_id = request.user_id
-    thread_id = request.thread_id
-    refinement_prompt = request.refinement_prompt
-
-    # Log refine request
-    logger.info(f"=== REFINE_SECTION_REQUEST: agent_id={agent_id}, section_id={section_id} ===")
-    logger.info(f"REFINE_SECTION_REQUEST: user_id={user_id}")
-    logger.info(f"REFINE_SECTION_REQUEST: thread_id={thread_id}")
-    logger.info(f"REFINE_SECTION_REQUEST: refinement_prompt={refinement_prompt[:100]}...")
-
-    # Convert section_id integer to string identifier for internal use
-    section_id_str = get_section_string_id(section_id)
-    if not section_id_str:
-        raise HTTPException(status_code=422, detail=f"Invalid section_id: {section_id}")
-
-    # Validate refinement_prompt is not just whitespace
-    if not refinement_prompt.strip():
-        raise HTTPException(status_code=422, detail="refinement_prompt cannot be empty or whitespace only")
-
-    # Refine is not supported for xbuddy agent
-    raise HTTPException(
-        status_code=422,
-        detail=f"Refine not supported for agent: {agent_id}. This feature is not available for xbuddy."
-    )
-
-    # Execute refinement
-    try:
-        result = await refine_section_content(
-            user_id=user_id,
-            thread_id=thread_id,
-            section_id=section_id_str,
-            refinement_prompt=refinement_prompt,
-            agent_graph=agent
-        )
-
-        # Log successful refinement
-        logger.info(f"=== REFINE_SECTION_SUCCESS: agent_id={agent_id}, section_id={section_id} (string_id={section_id_str}) ===")
-        logger.info(f"REFINE_SECTION_SUCCESS: refined_content_length={len(result.get('refined_content', {}).get('plain_text', ''))}")
-
-        return result
-
-    except ValueError as e:
-        logger.error(f"=== REFINE_SECTION_VALIDATION_ERROR: {str(e)} ===")
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"=== REFINE_SECTION_ERROR: agent_id={agent_id}, section_id={section_id} ===")
-        logger.error(f"REFINE_SECTION_ERROR: {str(e)}")
-        logger.error(f"REFINE_SECTION_ERROR: user_id={user_id}")
-        logger.error(f"REFINE_SECTION_ERROR: thread_id={thread_id}")
-        raise HTTPException(status_code=500, detail=f"Refine failed: {str(e)}")
-
 
 @app.get("/health")
 async def health_check():
@@ -1707,173 +1588,6 @@ async def subscribe_to_realtime(
             "success": False,
             "message": f"Failed to establish subscription: {str(e)}"
         }
-
-
-@router.get("/business_plan/{agent_id}")
-async def get_business_plan(
-    agent_id: str,
-    user_id: int,
-    thread_id: str,
-    request: Request,
-):
-    """
-    Get business plan from database for xbuddy agent.
-    
-    Args:
-        agent_id: Agent identifier (must be "xbuddy")
-        user_id: User identifier
-        thread_id: Thread/conversation identifier
-        request: FastAPI Request object (for accessing app.state)
-    
-    Returns:
-        Business plan document from database
-    """
-    if agent_id != "xbuddy":
-        raise HTTPException(
-            status_code=422,
-            detail=f"Business plan retrieval only supported for 'xbuddy' agent"
-        )
-    
-    logger.info(f"=== GET_BUSINESS_PLAN_REQUEST: agent_id={agent_id} ===")
-    logger.info(f"GET_BUSINESS_PLAN: user_id={user_id}, thread_id={thread_id}")
-    
-    # Subscribe to Realtime for this thread if enabled
-    # This ensures that when user opens BusinessPlanEditor, subscription is established
-    if settings.USE_SUPABASE_REALTIME and hasattr(request.app.state, 'realtime_worker'):
-        realtime_worker = request.app.state.realtime_worker
-        try:
-            await realtime_worker.subscribe_to_thread(
-                user_id=user_id,
-                thread_id=thread_id,
-                agent_id=agent_id
-            )
-            logger.info(f"✅ GET_BUSINESS_PLAN: Realtime subscription established for thread {thread_id}")
-        except Exception as e:
-            logger.warning(f"⚠️ GET_BUSINESS_PLAN: Failed to subscribe to Realtime for thread {thread_id}: {e}")
-    
-    try:
-        from integrations.supabase import SupabaseClient
-        import asyncio
-        
-        supabase = SupabaseClient()
-        loop = asyncio.get_event_loop()
-        
-        plan = await loop.run_in_executor(
-            None,
-            lambda: supabase.get_business_plan(user_id, thread_id)
-        )
-        
-        if plan:
-            logger.info(f"=== GET_BUSINESS_PLAN_SUCCESS ===")
-            return {
-                "success": True,
-                "business_plan": plan.get("content"),
-                "markdown_content": plan.get("markdown_content"),
-                "created_at": plan.get("created_at"),
-                "updated_at": plan.get("updated_at")
-            }
-        else:
-            return {
-                "success": False,
-                "message": "Business plan not found"
-            }
-    except ImportError:
-        logger.debug("Supabase not configured, checking agent state")
-        # Fallback to agent state if Supabase not configured
-        agent: AgentGraph = get_agent(agent_id)
-        config = RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
-        state_snapshot = await agent.aget_state(config=config)
-        state_values = state_snapshot.values if state_snapshot.values else {}
-        
-        if state_values.get("business_plan"):
-            return {
-                "success": True,
-                "business_plan": state_values["business_plan"],
-                "message": "Business plan retrieved from agent state"
-            }
-        else:
-            return {
-                "success": False,
-                "message": "Business plan not found"
-            }
-    except Exception as e:
-        logger.error(f"=== GET_BUSINESS_PLAN_ERROR ===")
-        logger.error(f"GET_BUSINESS_PLAN_ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get business plan: {str(e)}")
-
-
-@router.post("/generate_business_plan/{agent_id}")
-async def generate_business_plan(
-    agent_id: str,
-    user_id: int,
-    thread_id: str,
-):
-    """
-    Manually trigger business plan generation for xbuddy agent.
-    
-    This endpoint generates a comprehensive business plan based on all collected conversation data.
-    
-    Args:
-        agent_id: Agent identifier (must be "xbuddy")
-        user_id: User identifier
-        thread_id: Thread/conversation identifier
-    
-    Returns:
-        Business plan document in markdown format
-    """
-    if agent_id != "xbuddy":
-        raise HTTPException(
-            status_code=422,
-            detail=f"Business plan generation only supported for 'xbuddy' agent"
-        )
-    
-    logger.info(f"=== GENERATE_BUSINESS_PLAN_REQUEST: agent_id={agent_id} ===")
-    logger.info(f"GENERATE_BUSINESS_PLAN: user_id={user_id}, thread_id={thread_id}")
-    
-    try:
-        agent: AgentGraph = get_agent(agent_id)
-        config = RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
-        
-        # Get current state
-        state_snapshot = await agent.aget_state(config=config)
-        state_values = state_snapshot.values if state_snapshot.values else {}
-        
-        # Check if business plan already exists
-        if state_values.get("business_plan"):
-            logger.info("Business plan already exists, returning existing plan")
-            return {
-                "success": True,
-                "business_plan": state_values["business_plan"],
-                "message": "Business plan retrieved successfully"
-            }
-        
-        # Import and call generate_business_plan_node
-        from agents.xbuddy.nodes.generate_business_plan import generate_business_plan_node
-        
-        # Create a temporary state dict for the node
-        temp_state = dict(state_values)
-        temp_state = await generate_business_plan_node(temp_state, config)
-        
-        business_plan = temp_state.get("business_plan")
-        
-        if business_plan:
-            logger.info(f"=== GENERATE_BUSINESS_PLAN_SUCCESS ===")
-            logger.info(f"GENERATE_BUSINESS_PLAN: plan_length={len(business_plan)}")
-            return {
-                "success": True,
-                "business_plan": business_plan,
-                "message": "Business plan generated successfully"
-            }
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to generate business plan"
-            )
-            
-    except Exception as e:
-        logger.error(f"=== GENERATE_BUSINESS_PLAN_ERROR ===")
-        logger.error(f"GENERATE_BUSINESS_PLAN_ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate business plan: {str(e)}")
 
 
 app.include_router(router)
