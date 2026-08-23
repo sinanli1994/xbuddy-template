@@ -45,7 +45,7 @@ from ..extraction import extraction_changed, get_extract_model, merge_extraction
 from ..models import ContextPacket, SectionState, XBuddyData, XBuddyState
 from ..persistence import mark_final_output_stale, persist_section
 from ..sections.base_prompt import EXTRACTION_RULES
-from ..state_factory import coerce_section_state
+from ..state_factory import all_sections_complete, coerce_section_state
 
 logger = logging.getLogger(__name__)
 
@@ -142,16 +142,19 @@ def _section_progress(state: XBuddyState, section_id: SectionID) -> dict[str, An
     if sections != existing:
         update["section_states"] = sections
 
-    # Every one of the five, present and done. The per-section check matters:
-    # `all()` over a partial mapping would be vacuously true.
-    all_done = all(
-        (entry := sections.get(section.value)) is not None
-        and entry.status is SectionStatus.DONE
-        for section in SectionID
-    )
+    # One rule, two names. `finished` used to be written by the router and only
+    # when it happened to see a `next` directive, so a conversation whose fifth
+    # section completed on a `stay` turn stayed `finished=False` forever — and the
+    # completing turn routes memory_updater -> implementation -> END, bypassing the
+    # router entirely, so it could not have been set there anyway (Issue #10).
+    #
+    # Both flags now derive from the same `all_sections_complete` call, here, on the
+    # node that actually owns DONE transitions.
+    all_done = all_sections_complete(sections)
     if all_done:
         logger.info("memory_updater: all sections done; final output can be generated")
         update["should_generate_final_output"] = True
+        update["finished"] = True
 
     return update
 
@@ -219,13 +222,10 @@ def _invalidate_stale_artifact(
         }
         fragment["section_states"] = sections
 
-    all_done = all(
-        (entry := sections.get(section.value)) is not None
-        and entry.status is SectionStatus.DONE
-        for section in SectionID
-    )
-    if not all_done and state.get("should_generate_final_output"):
+    all_done = all_sections_complete(sections)
+    if not all_done and (state.get("should_generate_final_output") or state.get("finished")):
         fragment["should_generate_final_output"] = False
+        fragment["finished"] = False
 
     return sections, fragment
 

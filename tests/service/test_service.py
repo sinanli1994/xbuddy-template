@@ -1,10 +1,9 @@
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import langsmith
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
-from langgraph.pregel.types import StateSnapshot
 from langgraph.types import Interrupt
 
 from agents.agents import Agent
@@ -166,27 +165,37 @@ def test_feedback(mock_client: langsmith.Client, test_client) -> None:
 
 
 def test_history(test_client, mock_agent) -> None:
+    """PR 6 Stage 3 replaced this endpoint's contract.
+
+    It now requires `user_id`, reads through `aget_state` rather than the sync
+    `get_state`, and echoes the identifiers back. Updated here rather than left
+    failing because those are the exact assumptions the new contract replaces.
+    """
     QUESTION = "What is the weather in Tokyo?"
     ANSWER = "The weather in Tokyo is 70 degrees."
+    THREAD_ID = "7bcc7cc1-99d7-4b1d-bdb5-e6f90ed44de6"
+    USER_ID = 1
     user_question = HumanMessage(content=QUESTION)
     agent_response = AIMessage(content=ANSWER)
-    mock_agent.get_state.return_value = StateSnapshot(
-        values={"messages": [user_question, agent_response]},
-        next=(),
-        config={},
-        metadata=None,
-        created_at=None,
-        parent_config=None,
-        tasks=(),
-        interrupts=(),
-    )
+
+    async def aget_state(config=None):
+        snapshot = Mock()
+        snapshot.values = {
+            "user_id": USER_ID,
+            "messages": [user_question, agent_response],
+        }
+        return snapshot
+
+    mock_agent.aget_state = aget_state
 
     response = test_client.post(
-        "/history", json={"thread_id": "7bcc7cc1-99d7-4b1d-bdb5-e6f90ed44de6"}
+        "/history", json={"thread_id": THREAD_ID, "user_id": USER_ID}
     )
     assert response.status_code == 200
 
     output = ChatHistory.model_validate(response.json())
+    assert output.thread_id == THREAD_ID
+    assert output.user_id == USER_ID
     assert output.messages[0].type == "human"
     assert output.messages[0].content == QUESTION
     assert output.messages[1].type == "ai"

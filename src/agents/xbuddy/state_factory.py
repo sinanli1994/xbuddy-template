@@ -16,7 +16,7 @@ the service layer can import it without pulling in the graph.
 """
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .enums import RouterDirective, SectionID, SectionStatus
@@ -79,6 +79,33 @@ def coerce_section_state(value: Any) -> SectionState:
     if isinstance(value, SectionState):
         return value
     return SectionState.model_validate(value)
+
+
+def all_sections_complete(sections: Mapping[str, Any]) -> bool:
+    """True when every one of the five canonical sections is present and DONE.
+
+    The single completion rule. `should_generate_final_output` and `finished` are
+    both derived from this one call, so they cannot drift into two subtly different
+    answers about the same question (Issue #10).
+
+    Per-section rather than `all(... for entry in sections.values())`: that form is
+    vacuously true over a partial mapping, which would report a one-section
+    conversation as complete.
+
+    Tolerates a checkpoint-restored entry arriving as a plain dict, and compares
+    against `SectionStatus.DONE` — a `str` enum, so it matches the serialized
+    `"done"` too.
+    """
+    for section in SectionID:
+        entry = sections.get(section.value)
+        if entry is None:
+            return False
+        status = getattr(entry, "status", None)
+        if status is None and isinstance(entry, dict):
+            status = entry.get("status")
+        if status != SectionStatus.DONE:
+            return False
+    return True
 
 
 def merge_section_states(existing: Any) -> dict[str, SectionState]:

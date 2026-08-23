@@ -31,7 +31,19 @@ class PostgresConnectionManager:
             self.initialized = True
     
     def get_connection_string(self) -> str:
-        """Build PostgreSQL connection string"""
+        """The libpq conninfo string the pool connects with.
+
+        `POSTGRES_URI` wins when set and is passed through **verbatim** — including
+        its query parameters, so `sslmode`, `options`, and any pooler-specific flag
+        survive. Rewriting a URI the operator supplied would be a good way to break
+        a connection mode we did not anticipate.
+
+        Otherwise the five discrete fields are assembled as before, which keeps
+        existing local setups working unchanged.
+        """
+        if settings.POSTGRES_URI is not None:
+            return settings.POSTGRES_URI.get_secret_value()
+
         if settings.POSTGRES_PASSWORD is None:
             raise ValueError("POSTGRES_PASSWORD is not set")
 
@@ -96,7 +108,17 @@ class PostgresConnectionManager:
         except Exception as e:
             if "permission denied" in str(e).lower():
                 logger.warning("Skipping table setup (user lacks CREATE permission, checking if tables exist)")
-                # Verify required tables exist
+                # Verify required tables exist.
+                #
+                # The four checkpoint_* tables come from the saver's MIGRATIONS. `store`
+                # and `store_migrations` come from the store's: `setup()` creates
+                # `store_migrations` unconditionally, as its own version ledger.
+                #
+                # `store_vectors` is deliberately NOT here. It lives in
+                # VECTOR_MIGRATIONS, which `AsyncPostgresStore.setup()` runs only
+                # `if self.index_config` — and we construct the store as
+                # `AsyncPostgresStore(pool)` with no index, so it is never created.
+                # Requiring it would fail every correctly-provisioned deployment.
                 async with self.pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("""
@@ -140,7 +162,19 @@ class PostgresConnectionManager:
 
 # Keep original functions for backward compatibility
 def validate_postgres_config() -> None:
-    """Validate PostgreSQL configuration"""
+    """Fail loudly when Postgres is selected but not configured.
+
+    Called from `PostgresConnectionManager.setup()` before any connection is
+    attempted, so a misconfigured deployment refuses to start rather than silently
+    degrading. There is no fallback to SQLite on this path by design: quietly
+    switching a deployed service to an ephemeral file would lose every
+    conversation on the next restart, and would do it invisibly.
+
+    A single `POSTGRES_URI` satisfies the requirement on its own.
+    """
+    if settings.POSTGRES_URI is not None:
+        return
+
     required_vars = [
         "POSTGRES_USER",
         "POSTGRES_PASSWORD", 
@@ -153,7 +187,8 @@ def validate_postgres_config() -> None:
     if missing:
         raise ValueError(
             f"Missing required PostgreSQL configuration: {', '.join(missing)}. "
-            "These environment variables must be set to use PostgreSQL persistence."
+            "Set POSTGRES_URI, or set all of these environment variables, to use "
+            "PostgreSQL persistence."
         )
 
 

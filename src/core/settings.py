@@ -10,6 +10,7 @@ from pydantic import (
     SecretStr,
     TypeAdapter,
     computed_field,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -42,6 +43,9 @@ def check_str_is_http(x: str) -> str:
     return str(http_url_adapter.validate_python(x))
 
 
+DEV_BROWSER_ORIGIN = "http://localhost:3000"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=find_dotenv(),
@@ -56,6 +60,22 @@ class Settings(BaseSettings):
     PORT: int = Field(default=8080, description="Port to run the server on")
 
     AUTH_SECRET: SecretStr | None = None
+
+    # PR 6. Comma-separated browser origins allowed to call this API directly.
+    # Replaces the previous `allow_origins=["*"]`. The default covers local Next.js
+    # development only; a deployed frontend origin is supplied through the
+    # environment so no deployment URL is baked into the repository.
+    # Comma-separated browser origins. Left unset it means "the Next.js dev server"
+    # locally and "no browser origin at all" in production — see `cors_allow_origins`.
+    # Note `env_ignore_empty=True` above: an empty env value reads as *unset*, so a
+    # deployment cannot clear this by setting it to "". That is why the production
+    # default has to be empty rather than something that must be overridden.
+    CORS_ALLOW_ORIGINS: str = ""
+
+    # PR 6. Rate limit for the two expensive LLM entrypoints (/invoke, /stream).
+    # Conservative demo default: a public URL behind a shared token exposes real
+    # model spend, and this is the cheapest control that bounds it.
+    RATE_LIMIT_EXPENSIVE: str = "10/minute"
 
     OPENAI_API_KEY: SecretStr | None = None
     DEEPSEEK_API_KEY: SecretStr | None = None
@@ -100,6 +120,15 @@ class Settings(BaseSettings):
     SQLITE_DB_PATH: str = "/tmp/checkpoints.db"
 
     # PostgreSQL Configuration
+    #
+    # PR 6. `POSTGRES_URI` is the deployment-facing form: one libpq URI, which is
+    # exactly what Supabase hands you and what psycopg's pool already takes as its
+    # `conninfo`. It wins when set. The five discrete fields below remain the local
+    # and backwards-compatible path — nothing that already works stops working.
+    #
+    # Held as a SecretStr because the URI embeds the password. Include
+    # `?sslmode=require`; this code never rewrites the URI it is given.
+    POSTGRES_URI: SecretStr | None = None
     POSTGRES_USER: str | None = None
     POSTGRES_PASSWORD: SecretStr | None = None
     POSTGRES_HOST: str | None = None
@@ -130,6 +159,10 @@ class Settings(BaseSettings):
     SUPABASE_PUBLISHABLE_KEY: SecretStr | None = None
     SUPABASE_ANON_KEY: SecretStr | None = None
     SUPABASE_SERVICE_ROLE_KEY: SecretStr | None = None
+    # DEAD as of PR 6 — declared, but read by nothing. Setting it does NOT configure
+    # Postgres; the service would still fail `validate_postgres_config()` and refuse to
+    # start. Use `POSTGRES_URI` (or the five discrete POSTGRES_* fields) instead.
+    # Kept only so an existing .env carrying it does not become an unknown key.
     SUPABASE_DB_URL: str | None = None
     USE_SUPABASE_REALTIME: bool = False
 
@@ -244,6 +277,68 @@ class Settings(BaseSettings):
 
     def is_dev(self) -> bool:
         return self.MODE == "dev"
+
+    def is_production(self) -> bool:
+        """Whether this process is running as a deployed service.
+
+        Production is an **explicit opt-in**, not the absence of dev. `MODE` is
+        unset by default, so treating "not dev" as production would make every
+        local run fail the AUTH_SECRET check below — the opposite of the intended
+        developer convenience. Both spellings are accepted because
+        `tests/core/test_settings.py` already uses "prod".
+        """
+        return (self.MODE or "").strip().lower() in {"prod", "production"}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def cors_allow_origins(self) -> list[str]:
+        """`CORS_ALLOW_ORIGINS` parsed into a list, blanks dropped.
+
+        Never returns `["*"]` by accident. When nothing is configured the answer
+        depends on the mode, and the production half is the one that matters:
+
+        * **production** -> `[]`, denying every browser origin. The deployed
+          architecture is browser -> Vercel -> server-side proxy -> this API, so no
+          browser ever sends us a cross-origin request and there is nothing to allow.
+        * **anything else** -> the local Next.js dev server, so working locally needs
+          no ceremony.
+
+        The mode check is load-bearing rather than cosmetic. `env_ignore_empty=True`
+        means `CORS_ALLOW_ORIGINS=""` in a deployment config is read as *unset*, so
+        without this the field would fall back to its literal default and a
+        production API would quietly advertise `http://localhost:3000` as an allowed
+        origin — with the deployment config that looks like it set otherwise sitting
+        right there, inert.
+        """
+        configured = [
+            origin.strip()
+            for origin in (self.CORS_ALLOW_ORIGINS or "").split(",")
+            if origin.strip()
+        ]
+        if configured:
+            return configured
+        return [] if self.is_production() else [DEV_BROWSER_ORIGIN]
+
+    @model_validator(mode="after")
+    def _require_auth_secret_in_production(self) -> "Settings":
+        """A deployed service must never start with authentication disabled.
+
+        `verify_bearer` returns early when `AUTH_SECRET` is unset, which is
+        deliberate for local development — no token juggling while iterating. In a
+        deployed process that same branch would leave every route open to the
+        internet, and it would do so silently.
+
+        So the check is here, at configuration time, rather than as a second auth
+        mechanism: the process refuses to start instead of serving an unprotected
+        API. Local runs are unaffected because production is an explicit opt-in.
+        """
+        if self.is_production() and self.AUTH_SECRET is None:
+            raise ValueError(
+                "AUTH_SECRET is required when MODE is production. "
+                "Refusing to start with authentication disabled on a deployed "
+                "service. Set AUTH_SECRET, or unset MODE for local development."
+            )
+        return self
 
 
 settings = Settings()
