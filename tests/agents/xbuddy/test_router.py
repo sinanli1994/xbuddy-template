@@ -74,14 +74,17 @@ async def test_next_advances_past_a_done_section():
 
 
 @pytest.mark.asyncio
-async def test_next_with_everything_done_finishes():
+async def test_next_with_everything_done_holds_position():
+    """Issue #10 moved `finished` to memory_updater, which derives it from
+    `all_sections_complete`. The router keeps its routing behaviour — nothing left to
+    advance to, so hold — but no longer decides completion from a directive."""
     state = cold_state(
         current_section=SectionID.ACTION_PLAN,
         router_directive=RouterDirective.NEXT,
         section_states=all_done(),
     )
     update = await router_node(state, {})
-    assert update["finished"] is True
+    assert "finished" not in update
     assert update["current_section"] is SectionID.ACTION_PLAN
 
 
@@ -282,11 +285,17 @@ async def test_normalized_state_ends_turn_without_pending_input(directive):
 
 @pytest.mark.asyncio
 async def test_completion_transition_ends_the_turn():
-    """Fifth section finishing: memory_updater -> router -> END."""
+    """Fifth section finishing: memory_updater -> router -> END.
+
+    `finished` is set upstream by memory_updater now (Issue #10), so it is part of the
+    incoming state rather than something the router produces. What is pinned here is
+    unchanged: a complete conversation with no pending user input ends the turn.
+    """
     state = cold_state(
         current_section=SectionID.ACTION_PLAN,
         router_directive=RouterDirective.NEXT,
         section_states=all_done(),
+        finished=True,
         messages=[AIMessage(content="here is your plan")],
     )
     state.update(await router_node(state, {}))
@@ -305,6 +314,7 @@ async def test_new_user_message_on_finished_thread_still_replies():
         current_section=SectionID.ACTION_PLAN,
         router_directive=RouterDirective.NEXT,
         section_states=all_done(),
+        finished=True,
         messages=[HumanMessage(content="can we revisit my background?")],
     )
     state.update(await router_node(state, {}))
@@ -336,7 +346,13 @@ async def test_valid_modify_reopens_finished_workflow():
     update = await router_node(state, {})
 
     assert update["current_section"] is SectionID.BACKGROUND
-    assert update["finished"] is False
+
+    # Issue #10: the router no longer clears `finished`. It stays True until the
+    # section genuinely leaves DONE, which memory_updater does when the content
+    # changes — otherwise `finished` would claim incompleteness while all five
+    # sections still read `done`. The reopen flow is unaffected, because the user's
+    # modify message is pending input and `route_decision` replies on that.
+    assert "finished" not in update
 
     merged = update.get("section_states", sections)
     assert merged["background"].status is SectionStatus.DONE, "status preserved for PR 4"

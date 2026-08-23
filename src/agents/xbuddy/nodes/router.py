@@ -85,7 +85,7 @@ def _resolve_section(
         # sequence would skip the first section entirely.
         target = get_next_unfinished_section(section_states)
         if target is None:
-            logger.info("All sections complete; marking conversation finished")
+            logger.info("All sections complete; holding on the current section")
             return _Resolution(current_section, all_done=True)
         return _Resolution(target)
 
@@ -119,15 +119,19 @@ async def router_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState
         # Required for the fallback to actually route like stay — see module docstring.
         update["router_directive"] = RouterDirective.STAY
 
+    # The router no longer writes `finished` (Issue #10). It used to, but only from
+    # inside the `next` branch, which made completion a property of whichever
+    # directive the decision model happened to emit rather than of the sections
+    # themselves. `memory_updater` derives it from `all_sections_complete`, which is
+    # the same condition behind `should_generate_final_output`.
+    #
+    # Reopening is unaffected: a valid modify still routes to the target section, and
+    # `finished` returns to False when memory_updater actually demotes it off DONE.
+    # Until then the conversation is genuinely still complete, and `route_decision`
+    # keeps replying because the user's modify message is pending input.
     was_finished = bool(state.get("finished", False))
-    if resolution.all_done:
-        update["finished"] = True
-    elif was_finished and resolution.is_valid_modify:
-        # A valid modify on a finished workflow makes it live again. Section
-        # statuses and content stay as they are; memory_updater (PR 4) owns
-        # moving the reopened section off DONE when its content changes.
+    if was_finished and resolution.is_valid_modify:
         logger.info("Reopening finished conversation at section %s", section.value)
-        update["finished"] = False
 
     # Mark the active section in progress. PENDING is the only status promoted:
     # DONE is never downgraded, so a revisit keeps its record and a later `next`

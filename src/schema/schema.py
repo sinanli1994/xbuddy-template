@@ -265,10 +265,15 @@ class CompletionState(BaseModel):
     legitimately disagree — a completed conversation whose synthesis failed is
     `collection_complete=True, artifact_available=False`.
 
-    `finished` is deliberately **not** exposed. It is router-owned and
-    directive-gated (see Issue #10): a thread with every section done can sit at
-    `finished=False` indefinitely if the decision model keeps returning `stay`.
-    Publishing it would promote a latent bug into a public contract.
+    `finished` is deliberately **not** exposed, even though Issue #10 fixed its
+    semantics — it is now derived from the same section-completion rule as
+    `should_generate_final_output`, so it is no longer wrong, just internal.
+
+    Two reasons to keep it inside. It is graph state whose meaning is owned by the
+    agent, so publishing it would couple every client to a routing concept they have
+    no use for; and `collection_complete` plus `artifact_available` already answer the
+    two questions a client actually asks — is the interview over, and is there
+    something to render.
     """
 
     collection_complete: bool = Field(

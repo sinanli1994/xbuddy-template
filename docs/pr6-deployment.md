@@ -321,10 +321,20 @@ N × `RATE_LIMIT_EXPENSIVE`.
 replayed live — they are covered offline by the 603 agent tests. This is a narrower claim
 than "the agent works end to end".
 
-**`finished` is not exposed (Issue #10).** It is router-owned and directive-gated, so a
-thread with every section complete can sit at `finished=False` indefinitely. Publishing
-it would promote a latent bug into a public contract. The public projection uses
-`collection_complete` and `artifact_available` instead.
+**`finished` now means completion (Issue #10, fixed in this PR).** It used to be
+written by the router, and only from inside the `next` branch — so a thread whose fifth
+section completed on a `stay` turn sat at `finished=False` indefinitely. Worse, the
+completing turn routes `memory_updater -> implementation -> END` and never reaches the
+router at all, so the node that owned the flag was bypassed on exactly the turn that
+should have set it.
+
+Both `finished` and `should_generate_final_output` now derive from a single
+`all_sections_complete` call in `memory_updater`, the node that owns DONE transitions.
+Stale checkpoints self-heal on the next turn, so no migration was needed.
+
+**The public API is unchanged.** `finished` is still not exposed — clients read
+`collection_complete` and `artifact_available`, which describe what a client actually
+needs without coupling it to internal graph state.
 
 **The LangGraph store is assigned but never read.** `agent.store` is set in the lifespan
 and no JobBuddy code consumes it. Its tables exist because `setup()` creates them, not

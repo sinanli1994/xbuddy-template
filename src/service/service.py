@@ -383,9 +383,9 @@ def public_completion(state_values: dict[str, Any]) -> CompletionState:
     Three fields, each derived from exactly one internal signal:
 
     * `collection_complete` <- `should_generate_final_output`, which memory_updater
-      computes from section statuses alone. Not `finished`: that is router-owned and
-      only set when the router observes a `next` directive with nothing unfinished,
-      so it can stay False indefinitely on a completed thread (Issue #10).
+      computes from section statuses alone. Since Issue #10, `finished` is derived
+      from that same rule and would give the same answer — but it stays internal:
+      it is a routing concept, and clients should not be coupled to graph state.
     * `artifact_available` <- `final_output is not None`. The same signal
       implementation_node uses as its once-only guard.
     * `sections` <- all five in canonical `SectionID` order, projected to
