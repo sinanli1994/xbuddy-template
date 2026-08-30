@@ -2,9 +2,10 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { conversationStorage, ConversationRecord } from '@/utils/conversationStorage';
+import JobBuddyWelcome from '@/components/JobBuddyWelcome';
 
-interface Message {
+
+export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
@@ -16,6 +17,20 @@ interface Section {
   status: string;
 }
 
+/** One section, exactly as the backend's public projection sends it. */
+export interface PublicSection {
+  id: string;
+  name: string;
+  status: 'pending' | 'in_progress' | 'done';
+}
+
+/** The PR6 `completion` SSE event. Three fields, nothing internal. */
+export interface CompletionState {
+  collection_complete: boolean;
+  artifact_available: boolean;
+  sections: PublicSection[];
+}
+
 interface ChatAreaProps {
   selectedAgent: string;
   userId: number;
@@ -25,6 +40,7 @@ interface ChatAreaProps {
   currentSection: Section | null;
   onThreadIdChange: (threadId: string) => void;
   onSectionUpdate: (section: Section) => void;
+  onCompletionUpdate?: (completion: CompletionState) => void;
 }
 
 export default function ChatArea({
@@ -35,7 +51,8 @@ export default function ChatArea({
   loadedMessages,
   currentSection,
   onThreadIdChange,
-  onSectionUpdate
+  onSectionUpdate,
+  onCompletionUpdate
 }: ChatAreaProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -43,14 +60,12 @@ export default function ChatArea({
   const [streamingContent, setStreamingContent] = useState<string>('');
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [copiedAll, setCopiedAll] = useState(false);
-  const [isGeneratingLLM, setIsGeneratingLLM] = useState(false);
-  const [isAutoMode, setIsAutoMode] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const autoModeRef = useRef(false);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [messages, isLoading]);
 
   useEffect(() => {
@@ -59,19 +74,6 @@ export default function ChatArea({
     }
   }, [isLoading]);
 
-  // Add keyboard shortcut for auto-reply (Ctrl+G or Cmd+G)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'g') {
-        e.preventDefault();
-        handleAutoReply();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, selectedAgent, userId, isLoading, isGeneratingLLM, currentSection]);
 
   // Reset messages when threadId is null (reset button clicked)
   useEffect(() => {
@@ -80,8 +82,7 @@ export default function ChatArea({
       setInput('');
       setStreamingContent('');
       setIsLoading(false);
-      setIsAutoMode(false);
-      autoModeRef.current = false;
+
     }
   }, [threadId]);
 
@@ -92,59 +93,15 @@ export default function ChatArea({
     }
   }, [loadedMessages, threadId]);
 
-  // Save conversation to localStorage when messages or threadId changes
-  useEffect(() => {
-    if (threadId && messages.length > 0) {
-      const conversation: ConversationRecord = {
-        threadId,
-        agentType: selectedAgent,
-        userId,
-        createdAt: new Date().toISOString(),
-        lastUpdatedAt: new Date().toISOString(),
-        messages,
-        title: conversationStorage.generateTitle(messages),
-        currentSection: currentSection || undefined
-      };
-      conversationStorage.save(conversation);
-    }
-  }, [messages, threadId, selectedAgent, userId, currentSection]);
+  // No local transcript cache. The LangGraph checkpoint owns the conversation and
+  // /api/history returns it; a copy here would be a cache nobody invalidates.
 
-  // Sync autoModeRef with isAutoMode state
-  useEffect(() => {
-    autoModeRef.current = isAutoMode;
-  }, [isAutoMode]);
 
-  // Auto conversation trigger
-  useEffect(() => {
-    if (isAutoMode && !isLoading && !isGeneratingLLM && messages.length > 0) {
-      const lastMessage = messages[messages.length - 1];
-      // Only trigger if the last message is from assistant and has content
-      if (lastMessage.role === 'assistant' && lastMessage.content && lastMessage.content.trim() !== '') {
-        // Small delay to ensure stream is fully closed
-        const timer = setTimeout(() => {
-          if (autoModeRef.current && !isLoading && !isGeneratingLLM) {
-            handleAutoReply(true);
-          }
-        }, 100);
-        return () => clearTimeout(timer);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, isAutoMode, isLoading, isGeneratingLLM]);
 
-  const getAgentName = (agentId: string) => {
-    const names: Record<string, string> = {
-      'xbuddy': 'XBuddy'
-    };
-    return names[agentId] || 'AI Agent';
-  };
+  const getAgentName = (_agentId: string) => 'JobBuddy';
 
-  const getPlaceholderText = (agentId: string) => {
-    const placeholders: Record<string, string> = {
-      'xbuddy': 'Try: "I want to validate my startup idea"'
-    };
-    return placeholders[agentId] || 'Type your message...';
-  };
+  const getPlaceholderText = (_agentId: string) =>
+    'Message JobBuddy about your career goals...';
 
   // Extract send message logic
   const handleSendMessage = useCallback(async (messageContent: string) => {
@@ -207,6 +164,11 @@ export default function ChatArea({
       // Handle streaming mode
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
+      // A single SSE frame can straddle two network chunks, so the tail of a chunk is
+      // carried forward rather than parsed as though it were a complete line. Without
+      // this a token is dropped whenever a read happens to land mid-frame — rare
+      // locally, much less rare over a real network.
+      let carry = '';
 
       if (!reader) {
         throw new Error('No response body reader available');
@@ -220,14 +182,18 @@ export default function ChatArea({
 
       setMessages(prev => [...prev, tempAssistantMessage]);
       setStreamingContent('');
+      // Synchronous running total. State is not readable mid-loop, and deriving the
+      // text from a state updater is what broke streaming in the first place.
+      let accumulated = '';
 
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value, { stream: true });
+          const chunk = carry + decoder.decode(value, { stream: true });
           const lines = chunk.split('\n');
+          carry = lines.pop() ?? '';
 
           for (const line of lines) {
             if (line.startsWith('data: ')) {
@@ -243,18 +209,16 @@ export default function ChatArea({
                 const parsed = JSON.parse(data);
 
                 if (parsed.type === 'token') {
-                  // Accumulate tokens for streaming display - no filtering
-                  setStreamingContent(prev => {
-                    const newContent = prev + parsed.content;
-                    setMessages(prevMessages =>
-                      prevMessages.map(msg =>
-                        msg.id === tempAssistantMessage.id
-                          ? { ...msg, content: newContent }
-                          : msg
-                      )
-                    );
-                    return newContent;
-                  });
+                  accumulated += parsed.content;
+                  const nextContent = accumulated;
+                  setStreamingContent(nextContent);
+                  setMessages(prevMessages =>
+                    prevMessages.map(msg =>
+                      msg.id === tempAssistantMessage.id
+                        ? { ...msg, content: nextContent }
+                        : msg
+                    )
+                  );
                 } else if (parsed.type === 'metadata') {
                   // Handle metadata event - extract thread_id
                   if (parsed.content && parsed.content.thread_id && !threadId) {
@@ -265,6 +229,10 @@ export default function ChatArea({
                   // The backend sends these but we don't need to process them
                 } else if (parsed.type === 'section') {
                   onSectionUpdate(parsed.content);
+                } else if (parsed.type === 'completion') {
+                  // PR6's public completion projection: the five canonical sections
+                  // plus two booleans. Nothing internal crosses this boundary.
+                  onCompletionUpdate?.(parsed.content as CompletionState);
                 } else if (parsed.type === 'final_response') {
                   // Handle final response if needed
                   if (parsed.threadId && !threadId) {
@@ -303,67 +271,16 @@ export default function ChatArea({
       setMessages(prev => [...prev, errorMessage]);
       setIsLoading(false);
       // Stop auto mode on error
-      if (isAutoMode) {
-        setIsAutoMode(false);
-      }
     }
-  }, [isLoading, selectedAgent, userId, threadId, mode, onThreadIdChange, onSectionUpdate, isAutoMode]);
+  }, [isLoading, selectedAgent, userId, threadId, mode, onThreadIdChange, onSectionUpdate]);
 
-  const handleAutoReply = useCallback(async (autoSend = false) => {
-    if (isLoading || isGeneratingLLM || !selectedAgent || !userId) return;
-
-    setIsGeneratingLLM(true);
-
-    try {
-      // Call LLM API to generate response
-      const response = await fetch('/api/llm-generate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messages: messages,
-          agentType: selectedAgent,
-          currentSection: currentSection?.name || null
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to generate LLM response');
-      }
-
-      const data = await response.json();
-
-      if (autoSend) {
-        // Auto send the message
-        await handleSendMessage(data.message);
-      } else {
-        // Set the generated message in the input for preview
-        setInput(data.message);
-
-        // Focus the input field so user can review/edit before sending
-        setTimeout(() => {
-          inputRef.current?.focus();
-        }, 100);
-      }
-
-    } catch (error) {
-      console.error('Error generating LLM response:', error);
-      if (!autoSend) {
-        // Fallback message only for manual mode
-        setInput('Yes, let\'s continue.');
-      }
-    } finally {
-      setIsGeneratingLLM(false);
-    }
-  }, [isLoading, isGeneratingLLM, selectedAgent, userId, messages, currentSection, handleSendMessage]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     await handleSendMessage(input);
   };
 
-  const canSendMessage = selectedAgent && userId && input.trim() && !isLoading && !isAutoMode;
+  const canSendMessage = selectedAgent && userId && input.trim() && !isLoading;
 
   const copyToClipboard = async (text: string, messageId?: string) => {
     try {
@@ -393,7 +310,9 @@ export default function ChatArea({
       flex: 1,
       display: 'flex',
       flexDirection: 'column',
-      height: '100vh'
+      height: '100%',
+      minHeight: 0,
+      overflow: 'hidden'
     }}>
       {/* Header */}
       <div style={{
@@ -416,19 +335,6 @@ export default function ChatArea({
              gap: '8px'
            }}>
              {selectedAgent ? getAgentName(selectedAgent) : 'Select an Agent'}
-             {isAutoMode && (
-               <span style={{
-                 fontSize: '12px',
-                 padding: '2px 8px',
-                 backgroundColor: '#dc2626',
-                 color: 'white',
-                 borderRadius: '4px',
-                 fontWeight: 'normal',
-                 animation: 'pulse 2s infinite'
-               }}>
-                 AUTO MODE
-               </span>
-             )}
            </h1>
            {selectedAgent && (
              <p style={{
@@ -436,7 +342,7 @@ export default function ChatArea({
                color: '#64748b',
                margin: '4px 0 0 0'
              }}>
-               {selectedAgent === 'xbuddy' && 'Validate and refine your startup idea'}
+               AI Career Planning Agent
              </p>
            )}
          </div>
@@ -466,9 +372,10 @@ export default function ChatArea({
          )}
       </div>
 
-      {/* Messages */}
+      {/* Messages — the only scroll container in the app. */}
       <div style={{
         flex: 1,
+        minHeight: 0,
         overflowY: 'auto',
         padding: '24px',
         backgroundColor: '#f8fafc'
@@ -484,18 +391,7 @@ export default function ChatArea({
             </div>
           </div>
         ) : messages.length === 0 ? (
-          <div style={{
-            textAlign: 'center',
-            paddingTop: '100px',
-            color: '#64748b'
-          }}>
-            <div style={{ fontSize: '16px', marginBottom: '8px' }}>
-              🚀 Start your conversation with {getAgentName(selectedAgent)}
-            </div>
-            <div style={{ fontSize: '12px' }}>
-              {getPlaceholderText(selectedAgent)}
-            </div>
-          </div>
+          <JobBuddyWelcome />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {messages.map((message) => (
@@ -509,23 +405,79 @@ export default function ChatArea({
                   borderRadius: '12px',
                   backgroundColor: message.role === 'user' ? '#3b82f6' : '#ffffff',
                   color: message.role === 'user' ? 'white' : '#1e293b',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
-                  position: 'relative'
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
                 }}>
                   <div style={{
-                    fontSize: '10px',
-                    fontWeight: '500',
-                    marginBottom: '4px',
-                    opacity: 0.7
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '12px',
+                    marginBottom: '6px',
+                    minHeight: '20px'
                   }}>
-                    {message.role === 'user' ? 'You' : getAgentName(selectedAgent)}
+                    <span style={{
+                      fontSize: '10px',
+                      fontWeight: '500',
+                      opacity: 0.7,
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap'
+                    }}>
+                      {message.role === 'user' ? 'You' : getAgentName(selectedAgent)}
+                    </span>
+                    {message.role === 'assistant' && message.content && (
+                      <button
+                        onClick={() => copyToClipboard(message.content, message.id)}
+                        style={{
+                          flexShrink: 0,
+                          width: '22px',
+                          height: '22px',
+                          border: 'none',
+                          borderRadius: '4px',
+                          backgroundColor: copiedMessageId === message.id ? '#10b981' : '#f1f5f9',
+                          color: copiedMessageId === message.id ? 'white' : '#64748b',
+                          cursor: 'pointer',
+                          fontSize: '11px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          opacity: 0.7
+                        }}
+                        onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                        onMouseLeave={(e) => e.currentTarget.style.opacity = '0.7'}
+                        title={copiedMessageId === message.id ? "Copied!" : "Copy message"}
+                      >
+                        {copiedMessageId === message.id ? '✓' : '📋'}
+                      </button>
+                    )}
                   </div>
                   <div style={{
                     fontSize: '14px',
                     lineHeight: '1.5',
                     whiteSpace: message.role === 'user' ? 'pre-wrap' : 'normal'
                   }}>
-                    {message.role === 'assistant' ? (
+                    {message.role === 'assistant' && !message.content && isLoading ? (
+                      // In-bubble, not a second card. The old standalone "Thinking..."
+                      // block rendered alongside the streaming message, so one turn
+                      // showed two assistant bubbles. This lives inside the one bubble
+                      // and is replaced in place by the first token.
+                      <span
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: '#94a3b8' }}
+                        aria-live="polite"
+                      >
+                        <span
+                          style={{
+                            width: 12,
+                            height: 12,
+                            border: '2px solid #e2e8f0',
+                            borderTop: '2px solid #3b82f6',
+                            borderRadius: '50%',
+                            animation: 'spin 1s linear infinite'
+                          }}
+                        />
+                      </span>
+                    ) : message.role === 'assistant' ? (
                       <ReactMarkdown
                         components={{
                           p: ({ children }) => <p style={{ margin: '0 0 8px 0' }}>{children}</p>,
@@ -565,97 +517,33 @@ export default function ChatArea({
                       message.content
                     )}
                   </div>
-                  {message.role === 'assistant' && (
-                    <button
-                      onClick={() => copyToClipboard(message.content, message.id)}
-                      style={{
-                        position: 'absolute',
-                        top: '8px',
-                        right: '8px',
-                        width: '24px',
-                        height: '24px',
-                        border: 'none',
-                        borderRadius: '4px',
-                        backgroundColor: copiedMessageId === message.id ? '#10b981' : '#f1f5f9',
-                        color: copiedMessageId === message.id ? 'white' : '#64748b',
-                        cursor: 'pointer',
-                        fontSize: '12px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        opacity: 0.7,
-                        transition: 'all 0.2s ease',
-                        transform: copiedMessageId === message.id ? 'scale(1.1)' : 'scale(1)'
-                      }}
-                      onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
-                      onMouseLeave={(e) => e.currentTarget.style.opacity = '0.7'}
-                      title={copiedMessageId === message.id ? "Copied!" : "Copy message"}
-                    >
-                      {copiedMessageId === message.id ? '✓' : '📋'}
-                    </button>
-                  )}
                 </div>
               </div>
             ))}
 
-            {isLoading && (
-              <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-                <div style={{
-                  maxWidth: '70%',
-                  padding: '12px 16px',
-                  borderRadius: '12px',
-                  backgroundColor: '#ffffff',
-                  color: '#1e293b',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
-                }}>
-                  <div style={{
-                    fontSize: '10px',
-                    fontWeight: '500',
-                    marginBottom: '4px',
-                    opacity: 0.7
-                  }}>
-                    {getAgentName(selectedAgent)}
-                  </div>
-                  <div style={{
-                    fontSize: '14px',
-                    color: '#64748b',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '8px'
-                  }}>
-                    <div style={{
-                      width: '16px',
-                      height: '16px',
-                      border: '2px solid #f3f4f6',
-                      borderTop: '2px solid #3b82f6',
-                      borderRadius: '50%',
-                      animation: 'spin 1s linear infinite'
-                    }}></div>
-                    {mode === 'stream' ? 'Thinking...' : 'Processing...'}
-                  </div>
-                </div>
-              </div>
-            )}
-            
             <div ref={messagesEndRef} />
           </div>
         )}
       </div>
 
-      {/* Input */}
+      {/* Composer — a sibling of the scroll container, never inside it. */}
       <div style={{
+        flexShrink: 0,
         padding: '16px 24px',
         backgroundColor: 'white',
         borderTop: '1px solid #e2e8f0'
       }}>
-        <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '12px' }}>
+        <form
+          onSubmit={handleSubmit}
+          style={{ display: 'flex', gap: '12px', alignItems: 'stretch', minHeight: '46px' }}
+        >
           <input
             ref={inputRef}
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={isAutoMode ? 'Auto conversation in progress...' : (selectedAgent ? getPlaceholderText(selectedAgent) : 'Select an agent first...')}
-            disabled={!selectedAgent || !userId || isGeneratingLLM || isAutoMode}
+            placeholder={getPlaceholderText(selectedAgent)}
+            disabled={!selectedAgent || !userId}
             style={{
               flex: 1,
               padding: '12px 16px',
@@ -663,103 +551,10 @@ export default function ChatArea({
               borderRadius: '8px',
               fontSize: '14px',
               outline: 'none',
-              backgroundColor: isAutoMode ? '#f9fafb' : 'white',
-              cursor: isAutoMode ? 'not-allowed' : 'text'
+              backgroundColor: 'white',
+              cursor: 'text'
             }}
           />
-          <button
-            type="button"
-            onClick={() => handleAutoReply(false)}
-            disabled={!selectedAgent || !userId || isLoading || isGeneratingLLM || isAutoMode}
-            style={{
-              padding: '12px 20px',
-              backgroundColor: isGeneratingLLM
-                ? '#fbbf24'
-                : (!selectedAgent || !userId || isLoading || isAutoMode)
-                  ? '#d1d5db'
-                  : '#10b981',
-              color: 'white',
-              borderRadius: '8px',
-              border: 'none',
-              fontSize: '14px',
-              cursor: (!selectedAgent || !userId || isLoading || isGeneratingLLM || isAutoMode) ? 'not-allowed' : 'pointer',
-              fontWeight: '500',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              transition: 'all 0.2s ease'
-            }}
-            title="Generate response using AI (for testing)"
-          >
-            {isGeneratingLLM ? (
-              <>
-                <div style={{
-                  width: '14px',
-                  height: '14px',
-                  border: '2px solid rgba(255, 255, 255, 0.3)',
-                  borderTop: '2px solid white',
-                  borderRadius: '50%',
-                  animation: 'spin 0.8s linear infinite'
-                }}></div>
-                <span>Generating...</span>
-              </>
-            ) : (
-              <>
-                <span>🤖</span>
-                <span>Auto Reply</span>
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              if (isAutoMode) {
-                setIsAutoMode(false);
-                // If generating LLM, stop it immediately
-                if (isGeneratingLLM) {
-                  setIsGeneratingLLM(false);
-                }
-              } else {
-                setIsAutoMode(true);
-                // Start the conversation if no messages yet
-                if (messages.length === 0) {
-                  handleAutoReply(true);
-                }
-              }
-            }}
-            disabled={!selectedAgent || !userId || (!isAutoMode && (isLoading || isGeneratingLLM))}
-            style={{
-              padding: '12px 20px',
-              backgroundColor: isAutoMode
-                ? '#dc2626'
-                : (!selectedAgent || !userId || isLoading || isGeneratingLLM)
-                  ? '#d1d5db'
-                  : '#8b5cf6',
-              color: 'white',
-              borderRadius: '8px',
-              border: 'none',
-              fontSize: '14px',
-              cursor: (!selectedAgent || !userId || (!isAutoMode && (isLoading || isGeneratingLLM))) ? 'not-allowed' : 'pointer',
-              fontWeight: '500',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              transition: 'all 0.2s ease'
-            }}
-            title={isAutoMode ? "Stop auto conversation" : "Start auto conversation"}
-          >
-            {isAutoMode ? (
-              <>
-                <span>⏹️</span>
-                <span>Stop Auto</span>
-              </>
-            ) : (
-              <>
-                <span>▶️</span>
-                <span>Start Auto</span>
-              </>
-            )}
-          </button>
           <button
             type="submit"
             disabled={!canSendMessage}

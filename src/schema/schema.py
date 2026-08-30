@@ -211,6 +211,67 @@ class ChatHistoryInput(BaseModel):
     )
 
 
+class FinalOutputInput(BaseModel):
+    """Input for reading a thread's finished career plan.
+
+    Its own model rather than a reuse of `CompletionInput`. The two carry the same
+    two fields today, but they answer different questions, and sharing would mean a
+    change to one endpoint's request silently changing the other's.
+    """
+
+    thread_id: str = Field(
+        description="Thread whose final plan is being read.",
+        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
+    )
+    user_id: int = Field(
+        description="User the thread must belong to. Required; the read is scoped to it.",
+        examples=[1234],
+    )
+
+
+class FinalOutputResponse(BaseModel):
+    """One thread's finished career plan.
+
+    `final_output` is Markdown, which is what `implementation_node` actually stores:
+    it synthesises a structured `FinalOutput`, renders it through
+    `render_final_output`, and keeps the rendered document in state. There is no
+    structured object to project here, so nothing has to be flattened or hidden.
+
+    `artifact_available` is repeated from `CompletionState` deliberately. It is
+    derived from the same value the content comes from, so a client polling this
+    endpoint alone cannot see the two disagree.
+    """
+
+    thread_id: str = Field(description="The thread this plan belongs to.")
+    user_id: int = Field(description="The user the read was scoped to.")
+    artifact_available: bool = Field(
+        description="Whether a finished plan exists for this thread."
+    )
+    final_output: str | None = Field(
+        default=None,
+        description="The finished plan as Markdown, or null when none exists yet.",
+    )
+
+
+class CompletionInput(BaseModel):
+    """Input for reading a thread's public completion state.
+
+    Deliberately its own model rather than a reuse of `ChatHistoryInput`. The two
+    happen to carry the same two fields today, but they answer different questions,
+    and sharing the model would mean a change to one endpoint's request silently
+    changing the other's.
+    """
+
+    thread_id: str = Field(
+        description="Thread whose progress is being read.",
+        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
+    )
+    user_id: int = Field(
+        description="User the thread must belong to. Required; the read is scoped to it.",
+        examples=[1234],
+    )
+
+
 class ChatHistory(BaseModel):
     """Conversation messages for one thread.
 

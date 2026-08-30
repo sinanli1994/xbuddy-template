@@ -1,6 +1,21 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Tailwind v4. The project installs tailwindcss@4 with @tailwindcss/postcss, but
+   this file used the v3 "@tailwind base/components/utilities" directives, which v4
+   does not recognise — so Preflight never loaded and the built CSS contained no
+   "margin:0" at all. The browser's default "body { margin: 8px }" therefore applied,
+   making the document 100vh+16px tall and scrollable, which is what pushed the app
+   header out of the viewport. */
+@import "tailwindcss";
+
+/* The demo owns the viewport. Only the message pane scrolls; the document never
+   does. Stated explicitly rather than relying on Preflight alone, because this is a
+   load-bearing invariant of the layout and not a stylistic default. */
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
 
 :root {
   --background: #ffffff;
@@ -24,109 +39,4 @@ body {
   .text-balance {
     text-wrap: balance;
   }
-}
-
-/* Tiptap Editor Styles */
-.ProseMirror {
-  outline: none;
-  padding: 0.5rem;
-}
-
-.ProseMirror p {
-  margin: 0.5rem 0;
-}
-
-.ProseMirror p.is-editor-empty:first-child::before {
-  content: attr(data-placeholder);
-  float: left;
-  color: #adb5bd;
-  pointer-events: none;
-  height: 0;
-}
-
-.ProseMirror h1 {
-  font-size: 2em;
-  font-weight: bold;
-  margin: 0.67em 0;
-}
-
-.ProseMirror h2 {
-  font-size: 1.5em;
-  font-weight: bold;
-  margin: 0.75em 0;
-}
-
-.ProseMirror h3 {
-  font-size: 1.17em;
-  font-weight: bold;
-  margin: 0.83em 0;
-}
-
-.ProseMirror ul,
-.ProseMirror ol {
-  padding-left: 1.5em;
-  margin: 0.5em 0;
-}
-
-.ProseMirror ul {
-  list-style-type: disc;
-}
-
-.ProseMirror ol {
-  list-style-type: decimal;
-}
-
-.ProseMirror li {
-  margin: 0.25em 0;
-}
-
-.ProseMirror blockquote {
-  border-left: 4px solid #e2e8f0;
-  padding-left: 1em;
-  margin: 1em 0;
-  color: #64748b;
-}
-
-.ProseMirror code {
-  background-color: #f1f5f9;
-  padding: 0.2em 0.4em;
-  border-radius: 0.25rem;
-  font-family: 'Courier New', monospace;
-  font-size: 0.9em;
-}
-
-.ProseMirror pre {
-  background-color: #f1f5f9;
-  padding: 1em;
-  border-radius: 0.5rem;
-  overflow-x: auto;
-  margin: 1em 0;
-}
-
-.ProseMirror pre code {
-  background-color: transparent;
-  padding: 0;
-}
-
-.ProseMirror strong {
-  font-weight: bold;
-}
-
-.ProseMirror em {
-  font-style: italic;
-}
-
-.ProseMirror a {
-  color: #6366f1;
-  text-decoration: underline;
-}
-
-.ProseMirror a:hover {
-  color: #4f46e5;
-}
-
-.ProseMirror hr {
-  border: none;
-  border-top: 2px solid #e2e8f0;
-  margin: 1em 0;
 }
