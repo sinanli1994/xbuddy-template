@@ -39,6 +39,9 @@ from core.settings import DatabaseType
 # Removed: # DentApp (removed) integration
 from memory import initialize_database, initialize_store, pg_manager
 from schema import (
+    CompletionInput,
+    FinalOutputInput,
+    FinalOutputResponse,
     ChatHistory,
     ChatHistoryInput,
     ChatMessage,
@@ -1044,6 +1047,157 @@ async def history(input: ChatHistoryInput, agent_id: str = DEFAULT_AGENT) -> Cha
         f"user_id={input.user_id} ==="
     )
     return await load_chat_history(agent_id, input.thread_id, input.user_id)
+
+
+async def load_completion_state(
+    agent_id: str, thread_id: str, user_id: int
+) -> CompletionState:
+    """Read one thread's public completion projection.
+
+    The refresh counterpart to `/invoke` and the SSE `completion` event. Those two
+    are the only places the projection was ever emitted, so a browser reload could
+    restore the transcript but not the progress beside it.
+
+    Deliberately identical to `load_chat_history` in every respect that matters —
+    agent resolution, `aget_state`, ownership scoping, error handling — because the
+    two are the same kind of read and should not drift into two different trust
+    boundaries. It differs only in what it projects.
+
+    The projection itself is `public_completion`, unchanged and uncopied. That helper
+    is already the single source for `/invoke` and `/stream`; adding a third caller
+    is the whole point, and re-deriving completion here would recreate exactly the
+    drift PR 6 removed.
+    """
+    try:
+        agent: AgentGraph = get_agent(agent_id)
+    except KeyError as exc:
+        logger.warning(f"COMPLETION_UNKNOWN_AGENT: agent_id={agent_id}")
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id}") from exc
+
+    try:
+        state_snapshot = await agent.aget_state(
+            config=RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
+        )
+    except Exception as e:
+        logger.error(f"=== COMPLETION_ERROR: thread_id={thread_id} ===")
+        logger.error(f"COMPLETION_ERROR: {e!s}")
+        raise HTTPException(status_code=500, detail="Unexpected error") from e
+
+    values = state_snapshot.values or {}
+    if not values:
+        # Same shape as `/history`'s empty answer: a brand-new thread is not an error.
+        # `public_completion({})` yields the five canonical sections as `pending`,
+        # which is what a conversation that has not started actually looks like.
+        logger.info(f"COMPLETION_EMPTY: no state for thread_id={thread_id}")
+        return public_completion({})
+
+    # Identical deny-by-default rule to `/history`: a checkpoint whose stored user_id
+    # does not match cannot be described to the caller, not even as progress numbers.
+    owner_id = values.get("user_id")
+    if owner_id != user_id:
+        logger.warning(
+            f"COMPLETION_SCOPE_MISMATCH: thread_id={thread_id} requested_by={user_id}"
+        )
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    return public_completion(values)
+
+
+@router.post("/{agent_id}/completion")
+@router.post("/completion")
+async def completion(
+    input: CompletionInput, agent_id: str = DEFAULT_AGENT
+) -> CompletionState:
+    """Read the public completion projection for one thread.
+
+    Not rate-limited, for the same reason `/history` is not: it is a cheap state read
+    with no model call behind it.
+    """
+    logger.info(
+        f"=== COMPLETION_REQUEST: agent_id={agent_id} thread_id={input.thread_id} "
+        f"user_id={input.user_id} ==="
+    )
+    return await load_completion_state(agent_id, input.thread_id, input.user_id)
+
+
+async def load_final_output(
+    agent_id: str, thread_id: str, user_id: int
+) -> FinalOutputResponse:
+    """Read one thread's finished career plan.
+
+    Sourced from the checkpoint, which is where `implementation_node` puts the
+    rendered Markdown and where `artifact_available` already reads from. Using one
+    source for both means availability and content cannot contradict each other.
+
+    A `final-outputs` row also exists in Supabase and can legitimately differ: it is
+    the user-facing copy, and `is_downstream_edited` exists so an edit made elsewhere
+    is never overwritten. Reading it here would be right the moment an editing
+    surface exists again — the one this repo had was deleted with the rest of the
+    legacy frontend, so today no edit can be produced and the row is a copy of what
+    the checkpoint holds. Preferring the checkpoint keeps this endpoint consistent
+    with `/completion` and avoids a second source that can be missing: the Supabase
+    write is deliberately non-fatal, so a persistence failure would otherwise show
+    `artifact_available: true` with no content.
+
+    Read-only. No graph invocation, no model call, no write.
+    """
+    try:
+        agent: AgentGraph = get_agent(agent_id)
+    except KeyError as exc:
+        logger.warning(f"FINAL_OUTPUT_UNKNOWN_AGENT: agent_id={agent_id}")
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id}") from exc
+
+    try:
+        state_snapshot = await agent.aget_state(
+            config=RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
+        )
+    except Exception as e:
+        logger.error(f"=== FINAL_OUTPUT_ERROR: thread_id={thread_id} ===")
+        logger.error(f"FINAL_OUTPUT_ERROR: {e!s}")
+        raise HTTPException(status_code=500, detail="Unexpected error") from e
+
+    values = state_snapshot.values or {}
+    if not values:
+        # A brand-new thread is not an error, matching /history and /completion.
+        return FinalOutputResponse(
+            thread_id=thread_id, user_id=user_id, artifact_available=False, final_output=None
+        )
+
+    # The same deny-by-default rule as /history and /completion: a checkpoint whose
+    # stored user_id does not match is not described to the caller at all.
+    owner_id = values.get("user_id")
+    if owner_id != user_id:
+        logger.warning(
+            f"FINAL_OUTPUT_SCOPE_MISMATCH: thread_id={thread_id} requested_by={user_id}"
+        )
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    artifact = values.get("final_output")
+    return FinalOutputResponse(
+        thread_id=thread_id,
+        user_id=user_id,
+        # The identical derivation `public_completion` uses, so the two endpoints
+        # cannot report different availability for the same state.
+        artifact_available=artifact is not None,
+        final_output=artifact,
+    )
+
+
+@router.post("/{agent_id}/final_output")
+@router.post("/final_output")
+async def final_output(
+    input: FinalOutputInput, agent_id: str = DEFAULT_AGENT
+) -> FinalOutputResponse:
+    """Read the finished career plan for one thread.
+
+    Not rate-limited, like /history and /completion: a state read with no model call
+    behind it.
+    """
+    logger.info(
+        f"=== FINAL_OUTPUT_REQUEST: agent_id={agent_id} thread_id={input.thread_id} "
+        f"user_id={input.user_id} ==="
+    )
+    return await load_final_output(agent_id, input.thread_id, input.user_id)
 
 
 @router.get("/check_agent_state/{agent_id}")

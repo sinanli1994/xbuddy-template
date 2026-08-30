@@ -61,3 +61,4 @@ dist/
 scripts/*
 !scripts/fly_connectivity_probe.py
 !scripts/fly_durability_probe.py
+!scripts/seed_demo_final_output.py

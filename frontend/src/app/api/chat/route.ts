@@ -1,3 +1,10 @@
+import { DEFAULT_AGENT_ID, jobbuddyApiUrl, jobbuddyHeaders } from '@/lib/jobbuddyApi';
+
+// The Node runtime, because the edge runtime buffers differently and this route's
+// whole job is to not buffer. force-dynamic keeps Next from trying to cache a stream.
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
 const logApiCall = (phase: string, data: Record<string, unknown>, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') => {
   const timestamp = new Date().toISOString();
   const logLevel = process.env.NODE_ENV === 'development' ? 'DEBUG' : 'INFO';
@@ -17,7 +24,7 @@ export async function POST(req: Request) {
   const requestStartTime = Date.now();
   
   try {
-    const { messages, userId, threadId, mode = 'stream', agentId = 'value-canvas' } = await req.json();
+    const { messages, userId, threadId, mode = 'stream', agentId = DEFAULT_AGENT_ID } = await req.json();
     const latestMessage = messages[messages.length - 1]?.content || '';
     
     // Detailed request start log
@@ -38,7 +45,7 @@ export async function POST(req: Request) {
       environment: {
         nodeEnv: process.env.NODE_ENV,
         apiEnv: process.env.NEXT_PUBLIC_API_ENV,
-        hasAuthToken: !!process.env.VALUE_CANVAS_API_TOKEN
+        hasAuthToken: !!process.env.JOBBUDDY_API_TOKEN
       }
     });
 
@@ -78,15 +85,17 @@ export async function POST(req: Request) {
     }
 
     const isLocal = process.env.NEXT_PUBLIC_API_ENV === 'local';
-    const apiUrl = isLocal 
-      ? process.env.VALUE_CANVAS_API_URL_LOCAL 
-      : process.env.VALUE_CANVAS_API_URL_PRODUCTION;
-    
+    let apiUrl: string | null = null;
+    try {
+      apiUrl = jobbuddyApiUrl();
+    } catch {
+      apiUrl = null;
+    }
+
     // Check if API URL is configured
     if (!apiUrl) {
-      const errorMsg = isLocal 
-        ? 'Backend API URL not configured. Please set VALUE_CANVAS_API_URL_LOCAL environment variable.'
-        : 'Backend API URL not configured. Please set VALUE_CANVAS_API_URL_PRODUCTION environment variable in Vercel settings.';
+      const errorMsg =
+        'Backend API URL not configured. Set JOBBUDDY_API_URL (see .env.example).';
       
       logApiCall('CONFIGURATION_ERROR', {
         timestamp: new Date().toISOString(),
@@ -120,7 +129,7 @@ export async function POST(req: Request) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          hasAuthToken: !!process.env.VALUE_CANVAS_API_TOKEN
+          hasAuthToken: !!process.env.JOBBUDDY_API_TOKEN
         },
         body: requestBody
       },
@@ -135,13 +144,9 @@ export async function POST(req: Request) {
     
     const response = await fetch(fullApiUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(process.env.VALUE_CANVAS_API_TOKEN && {
-          'Authorization': `Bearer ${process.env.VALUE_CANVAS_API_TOKEN}`
-        })
-      },
+      headers: jobbuddyHeaders(),
       body: JSON.stringify(requestBody),
+      cache: 'no-store',
     });
 
     // Detailed external API response log
@@ -448,8 +453,11 @@ export async function POST(req: Request) {
     return new Response(stream, {
       headers: {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        // no-transform matters as much as no-cache: without it an intermediary may
+        // coalesce chunks and the stream silently stops looking like a stream.
+        'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
       },
     });
 
