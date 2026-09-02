@@ -3,6 +3,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import JobBuddyWelcome from '@/components/JobBuddyWelcome';
+import ProgressiveText from '@/components/ProgressiveText';
+import {
+  chatScrollBehavior,
+  isNearChatBottom,
+  type ChatScrollTrigger,
+} from '@/utils/chatScroll';
+import { planMessageEvent } from '@/utils/chatStream';
 
 
 export interface Message {
@@ -41,6 +48,7 @@ interface ChatAreaProps {
   onThreadIdChange: (threadId: string) => void;
   onSectionUpdate: (section: Section) => void;
   onCompletionUpdate?: (completion: CompletionState) => void;
+  onFirstUserMessage?: (content: string) => void;
 }
 
 export default function ChatArea({
@@ -52,21 +60,50 @@ export default function ChatArea({
   currentSection,
   onThreadIdChange,
   onSectionUpdate,
-  onCompletionUpdate
+  onCompletionUpdate,
+  onFirstUserMessage,
 }: ChatAreaProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [streamingContent, setStreamingContent] = useState<string>('');
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [copiedAll, setCopiedAll] = useState(false);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesPaneRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const isNearBottomRef = useRef(true);
+  const hasUserMessageRef = useRef(false);
+  const scrollFrameRef = useRef<number | null>(null);
+  // Visual policy for this mounted thread, never another transcript/state cache.
+  const revealMessageIdsRef = useRef(new Set<string>());
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [messages, isLoading]);
+  const scheduleChatScroll = useCallback((trigger: ChatScrollTrigger) => {
+    const behavior = chatScrollBehavior(trigger, isNearBottomRef.current);
+    if (behavior === null) return;
+
+    // Token events may arrive more than once per paint. Coalesce them into one
+    // direct container scroll, and re-check the ref inside the frame so a manual
+    // upward scroll that happened meanwhile wins.
+    if (trigger === 'stream-token' && scrollFrameRef.current !== null) return;
+    if (trigger !== 'stream-token' && scrollFrameRef.current !== null) {
+      cancelAnimationFrame(scrollFrameRef.current);
+      scrollFrameRef.current = null;
+    }
+
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const pane = messagesPaneRef.current;
+      if (!pane) return;
+      if (trigger === 'stream-token' && !isNearBottomRef.current) return;
+      pane.scrollTo({ top: pane.scrollHeight, behavior });
+    });
+  }, []);
+
+  const scrollRevealedText = useCallback(() => scheduleChatScroll('stream-token'), [scheduleChatScroll]);
+
+  useEffect(() => () => {
+    if (scrollFrameRef.current !== null) cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
 
   useEffect(() => {
     if (!isLoading) {
@@ -78,20 +115,28 @@ export default function ChatArea({
   // Reset messages when threadId is null (reset button clicked)
   useEffect(() => {
     if (threadId === null) {
+      revealMessageIdsRef.current.clear();
       setMessages([]);
       setInput('');
-      setStreamingContent('');
       setIsLoading(false);
+      isNearBottomRef.current = true;
+      hasUserMessageRef.current = false;
 
     }
   }, [threadId]);
 
   // Load messages when conversation is selected
   useEffect(() => {
-    if (loadedMessages && loadedMessages.length > 0) {
-      setMessages(loadedMessages);
+    if (loadedMessages) {
+      revealMessageIdsRef.current.clear();
+      hasUserMessageRef.current = loadedMessages.some((message) => message.role === 'user');
+      if (loadedMessages.length > 0) {
+        setMessages(loadedMessages);
+        isNearBottomRef.current = true;
+        scheduleChatScroll('restored-history');
+      }
     }
-  }, [loadedMessages, threadId]);
+  }, [loadedMessages, threadId, scheduleChatScroll]);
 
   // No local transcript cache. The LangGraph checkpoint owns the conversation and
   // /api/history returns it; a copy here would be a cache nobody invalidates.
@@ -106,6 +151,10 @@ export default function ChatArea({
   // Extract send message logic
   const handleSendMessage = useCallback(async (messageContent: string) => {
     if (!messageContent.trim() || isLoading || !selectedAgent || !userId) return;
+    const requestStartedAt = performance.now();
+    if (process.env.NODE_ENV === 'development') {
+      console.debug('[JobBuddy timing] submit', { atMs: requestStartedAt });
+    }
 
     const userMessage: Message = {
       id: Date.now().toString() + '-user',
@@ -113,7 +162,18 @@ export default function ChatArea({
       content: messageContent.trim()
     };
 
+    if (!hasUserMessageRef.current) {
+      hasUserMessageRef.current = true;
+      onFirstUserMessage?.(userMessage.content);
+    }
+
+    // Sending is an explicit navigation action: reveal the new message once with
+    // animation, then token growth below uses direct scrolls only.
+    isNearBottomRef.current = true;
+    // A follow-up finishes older visual reveals, without delaying the new turn.
+    revealMessageIdsRef.current.clear();
     setMessages(prev => [...prev, userMessage]);
+    scheduleChatScroll('new-user-message');
     setInput('');
     setIsLoading(true);
 
@@ -181,10 +241,18 @@ export default function ChatArea({
       };
 
       setMessages(prev => [...prev, tempAssistantMessage]);
-      setStreamingContent('');
+      scheduleChatScroll('stream-token');
       // Synchronous running total. State is not readable mid-loop, and deriving the
       // text from a state updater is what broke streaming in the first place.
       let accumulated = '';
+      // Every assistant line already on screen for this turn. A `message` event
+      // repeating one of them is the backend echoing text that arrived as tokens;
+      // a `message` event carrying anything else is a message the user would
+      // otherwise only discover after a refresh.
+      const shownThisTurn: string[] = [];
+      // Extra bubbles appended after the streamed reply, so the token handler keeps
+      // writing to the streamed bubble and never overwrites one of these.
+      let extraBubbleCount = 0;
 
       try {
         while (true) {
@@ -201,7 +269,6 @@ export default function ChatArea({
               if (data === '[DONE]') {
                 // Stream is complete
                 setIsLoading(false);
-                setStreamingContent('');
                 return;
               }
 
@@ -211,7 +278,6 @@ export default function ChatArea({
                 if (parsed.type === 'token') {
                   accumulated += parsed.content;
                   const nextContent = accumulated;
-                  setStreamingContent(nextContent);
                   setMessages(prevMessages =>
                     prevMessages.map(msg =>
                       msg.id === tempAssistantMessage.id
@@ -219,19 +285,58 @@ export default function ChatArea({
                         : msg
                     )
                   );
+                  scheduleChatScroll('stream-token');
                 } else if (parsed.type === 'metadata') {
                   // Handle metadata event - extract thread_id
                   if (parsed.content && parsed.content.thread_id && !threadId) {
                     onThreadIdChange(parsed.content.thread_id);
                   }
                 } else if (parsed.type === 'message') {
-                  // Skip duplicate message events - content is already handled via tokens
-                  // The backend sends these but we don't need to process them
+                  // A turn can persist more than one assistant message, and only
+                  // the reply has tokens behind it. See planMessageEvent for why
+                  // ignoring these outright made the readiness line appear only
+                  // after a refresh.
+                  const outcome = planMessageEvent(parsed.content, {
+                    accumulated,
+                    shown: shownThisTurn,
+                    extraBubbles: extraBubbleCount,
+                  });
+
+                  if (outcome.kind === 'fill-placeholder') {
+                    revealMessageIdsRef.current.add(tempAssistantMessage.id);
+                    accumulated = outcome.text;
+                    shownThisTurn.push(outcome.text.trim());
+                    const nextContent = outcome.text;
+                    setMessages(prevMessages =>
+                      prevMessages.map(msg =>
+                        msg.id === tempAssistantMessage.id
+                          ? { ...msg, content: nextContent }
+                          : msg
+                      )
+                    );
+                    scheduleChatScroll('stream-token');
+                  } else if (outcome.kind === 'append-bubble') {
+                    extraBubbleCount += 1;
+                    shownThisTurn.push(outcome.text.trim());
+                    const extra: Message = {
+                      id: `${tempAssistantMessage.id}-extra-${extraBubbleCount}`,
+                      role: 'assistant',
+                      content: outcome.text,
+                    };
+                    revealMessageIdsRef.current.add(extra.id);
+                    setMessages(prevMessages => [...prevMessages, extra]);
+                    scheduleChatScroll('stream-token');
+                  }
                 } else if (parsed.type === 'section') {
                   onSectionUpdate(parsed.content);
                 } else if (parsed.type === 'completion') {
                   // PR6's public completion projection: the five canonical sections
                   // plus two booleans. Nothing internal crosses this boundary.
+                  if (process.env.NODE_ENV === 'development') {
+                    console.debug('[JobBuddy timing] completion-received', {
+                      atMs: performance.now(), elapsedMs: performance.now() - requestStartedAt,
+                    });
+                  }
                   onCompletionUpdate?.(parsed.content as CompletionState);
                 } else if (parsed.type === 'final_response') {
                   // Handle final response if needed
@@ -248,6 +353,7 @@ export default function ChatArea({
                         : msg
                     )
                   );
+                  scheduleChatScroll('stream-token');
                 }
               } catch (e) {
                 console.error('Parse error:', e);
@@ -272,7 +378,18 @@ export default function ChatArea({
       setIsLoading(false);
       // Stop auto mode on error
     }
-  }, [isLoading, selectedAgent, userId, threadId, mode, onThreadIdChange, onSectionUpdate]);
+  }, [
+    isLoading,
+    selectedAgent,
+    userId,
+    threadId,
+    mode,
+    onThreadIdChange,
+    onSectionUpdate,
+    onCompletionUpdate,
+    onFirstUserMessage,
+    scheduleChatScroll,
+  ]);
 
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -373,13 +490,20 @@ export default function ChatArea({
       </div>
 
       {/* Messages — the only scroll container in the app. */}
-      <div style={{
+      <div
+        ref={messagesPaneRef}
+        onScroll={(event) => {
+          const pane = event.currentTarget;
+          isNearBottomRef.current = isNearChatBottom(pane);
+        }}
+        style={{
         flex: 1,
         minHeight: 0,
         overflowY: 'auto',
         padding: '24px',
         backgroundColor: '#f8fafc'
-      }}>
+        }}
+      >
         {!selectedAgent ? (
           <div style={{
             textAlign: 'center',
@@ -478,6 +602,12 @@ export default function ChatArea({
                         />
                       </span>
                     ) : message.role === 'assistant' ? (
+                      <ProgressiveText
+                        text={message.content}
+                        animate={revealMessageIdsRef.current.has(message.id)}
+                        onProgress={scrollRevealedText}
+                      >
+                        {(visibleContent) => (
                       <ReactMarkdown
                         components={{
                           p: ({ children }) => <p style={{ margin: '0 0 8px 0' }}>{children}</p>,
@@ -511,8 +641,10 @@ export default function ChatArea({
                           }}>{children}</blockquote>
                         }}
                       >
-                        {message.content}
+                        {visibleContent}
                       </ReactMarkdown>
+                        )}
+                      </ProgressiveText>
                     ) : (
                       message.content
                     )}
@@ -520,8 +652,6 @@ export default function ChatArea({
                 </div>
               </div>
             ))}
-
-            <div ref={messagesEndRef} />
           </div>
         )}
       </div>

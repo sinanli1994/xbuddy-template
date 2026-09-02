@@ -278,6 +278,26 @@ async def test_normalized_state_ends_turn_without_pending_input(directive):
     assert route_decision(state) is None
 
 
+@pytest.mark.parametrize("directive", [RouterDirective.NEXT, "modify:background"])
+def test_navigation_after_an_ai_reply_advances_state_without_replying_again(directive):
+    """Regression: the post-memory router pass must not create reply #2.
+
+    Removing the AI-message guard makes this return ``generate_reply`` and
+    reproduces the concatenated Career Goal -> Background transition seen in
+    production.
+    """
+    state = cold_state(
+        current_section=SectionID.CAREER_GOAL,
+        router_directive=directive,
+        messages=[
+            HumanMessage(content="yes, that's right"),
+            AIMessage(content="Great — let's move on to your background."),
+        ],
+    )
+
+    assert route_decision(state) is None
+
+
 # --------------------------------------------------------------------------
 # Completion routing
 # --------------------------------------------------------------------------
@@ -383,7 +403,7 @@ async def test_invalid_modify_does_not_reopen():
 
 
 @pytest.mark.asyncio
-async def test_initialize_then_router_through_compiled_graph(monkeypatch, make_decision):
+async def test_initialize_then_router_through_compiled_graph(monkeypatch, make_decision, extraction_chain):
     """PR 2's router contract, still holding once the turn runs to completion.
 
     Written for PR 2, when the graph stopped at generate_reply's

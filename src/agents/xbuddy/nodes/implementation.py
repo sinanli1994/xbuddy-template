@@ -14,9 +14,13 @@ Three properties matter most:
   (`route_after_memory_updater`). Guarding on the flag would either regenerate the
   document every turn or require clearing a flag other nodes read.
 * **The artifact does not go through the chat.** The synthesis call is tagged
-  `internal_synthesis`, which the service drops at service.py:762, and this node
-  appends one short readiness line rather than the document. The user reads it in
-  the editor.
+  `internal_synthesis`, which the service drops, and this node appends one short
+  readiness line rather than the document. The user reads the document in the
+  Final Plan panel.
+
+  That readiness line is a real, checkpointed assistant message, so it is part of
+  the canonical transcript that `/history` returns. The streaming path must emit
+  it during the live turn or the transcript changes under the user on refresh.
 * **Never raises, never half-writes.** Any failure leaves `final_output` unset, so
   the next turn retries cleanly. A partially-written artifact would be
   indistinguishable from a complete one to every reader.
@@ -29,7 +33,7 @@ invalidating it when a completed section is reopened, are later stages — so to
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from ..enums import SectionID, SectionStatus
@@ -38,14 +42,21 @@ from ..models import XBuddyState
 from ..persistence import persist_final_output
 from ..state_factory import coerce_section_state
 from ..synthesis import synthesize_final_output
+from .process_confirmation import confirmation_processed
 
 logger = logging.getLogger(__name__)
 
 # The whole of what the chat says about the artifact. Deliberately one line: the
-# document is long, structured, and lives in the editor, and pasting Markdown into
-# a chat bubble is worse than pointing at it.
+# document is long and structured, and pasting Markdown into a chat bubble is worse
+# than pointing at the panel that renders it.
+#
+# The wording names the control the user actually has. FinalPlanPanel is read-only
+# by construction -- no editor, no regenerate, no export -- so the earlier "you can
+# open and edit it now" promised an affordance that does not exist.
 FINAL_OUTPUT_READY_MESSAGE = (
-    "Your job search strategy is ready — you can open and edit it now."
+    "You're all set. We've completed all five sections and used the information "
+    "we collected to generate your personalized final career plan. "
+    'Open "View Final Plan" in the sidebar to read it.'
 )
 
 # Values for the `final_output_pending` state key. One scalar rather than a queue:
@@ -69,10 +80,17 @@ def _error_update(state: XBuddyState, reasons: list[str]) -> dict[str, Any]:
     """
     joined = "; ".join(reasons)
     logger.warning("implementation: %s", joined)
-    return {
+    update: dict[str, Any] = {
         "last_error": joined,
         "error_count": state.get("error_count", 0) + 1,
     }
+    messages = state.get("messages", [])
+    if confirmation_processed(state) and messages and isinstance(messages[-1], HumanMessage):
+        update["messages"] = [AIMessage(content=(
+            "I couldn't finish preparing the final plan this time. "
+            "Your collected information is still available; please try again."
+        ))]
+    return update
 
 
 async def _write_durable(state: XBuddyState, markdown: str) -> tuple[bool, str | None]:
@@ -128,13 +146,20 @@ async def implementation_node(state: XBuddyState, config: RunnableConfig) -> XBu
     State transition, in order:
 
     1. `final_output` already set -> `{}`. No model call, no message, no error.
-    2. Ineligible -> `last_error` + `error_count += 1`. No artifact, no message.
+    2. Ineligible -> `last_error` + `error_count += 1`. No artifact.
     3. Synthesis fails -> same. `final_output` stays unset so a later turn retries.
     4. Success -> `{"final_output": <markdown>, "messages": [one AIMessage]}`.
 
-    Never raises: the graph edge is `implementation -> END`, so an exception here
-    would take down a turn whose conversational work has already succeeded.
+    Pre-reply confirmation failures append one safe error reply. If an existing
+    artifact needed no new message, the graph routes the pending input back for
+    its conversational reply; success/readiness otherwise ends the turn.
     """
+    logger.info(
+        "implementation: enter thread=%s requested=%s agreed_steps=%d artifact_present=%s",
+        state.get("thread_id"), state.get("should_generate_final_output", False),
+        len(state["user_data"].action_items) if state.get("user_data") is not None else 0,
+        state.get("final_output") is not None,
+    )
     existing_artifact = state.get("final_output")
     if existing_artifact:
         # The guard is about *synthesis*, not about persistence. An artifact whose
@@ -160,6 +185,7 @@ async def implementation_node(state: XBuddyState, config: RunnableConfig) -> XBu
     assert user_data is not None  # guaranteed by _ineligibility_reasons
 
     try:
+        logger.info("implementation: starting synthesis thread=%s", state.get("thread_id"))
         final_output, error = await synthesize_final_output(user_data)
     except Exception as exc:  # synthesize_final_output should not raise; belt and braces
         logger.exception("implementation: synthesis raised unexpectedly")

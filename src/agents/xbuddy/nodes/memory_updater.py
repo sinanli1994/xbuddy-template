@@ -24,6 +24,8 @@ Four properties matter most:
 * **Satisfaction, extraction, and persistence are independent.** Section
   progress is computed before either model or network call, so neither a failed
   extraction nor a failed write can withhold a completion the user confirmed.
+  The pre-reply final confirmation is stricter: fewer than three stored agreed
+  steps keeps Action Plan open instead of claiming an unusable collection complete.
 * **One error per turn.** Reasons are accumulated and reported together, so
   `error_count` advances at most once no matter how many things failed. See
   `memory_updater_node` for the precedence rule.
@@ -36,16 +38,17 @@ divergence observable rather than silent.
 import logging
 from typing import Any
 
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
 from ..enums import SectionID, SectionStatus
 from ..extraction import extraction_changed, get_extract_model, merge_extraction
-from ..models import ContextPacket, SectionState, XBuddyData, XBuddyState
+from ..models import ContextPacket, PendingActionPlan, SectionState, XBuddyData, XBuddyState
 from ..persistence import mark_final_output_stale, persist_section
 from ..sections.base_prompt import EXTRACTION_RULES
 from ..state_factory import all_sections_complete, coerce_section_state
+from .process_confirmation import confirmation_processed
 
 logger = logging.getLogger(__name__)
 
@@ -455,7 +458,14 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     # Nothing said yet means nothing to extract. Not a failure — a turn with no
     # new facts, which still gets its progress and persistence applied.
     merged: XBuddyData | None = None
-    if messages:
+    accepted = _accepted_proposal(state, packet, messages)
+    if accepted is not None:
+        # Do not ask another LLM to reconstruct the very steps just confirmed.
+        # Their text/order came from the validated, checkpointed proposal.
+        candidate = before.model_copy(update={"action_items": accepted}, deep=True)
+        merged = candidate if extraction_changed(before, candidate) else None
+        logger.info("memory_updater: confirmed stored Action Plan (%d steps)", len(accepted))
+    elif messages:
         merged, extraction_error = await _extract(packet, before, messages, config)
         if extraction_error is not None:
             errors.append(extraction_error)
@@ -463,6 +473,35 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
         logger.debug("memory_updater: empty message history; nothing to extract")
 
     effective_data = merged if merged is not None else before
+    decision_output = state.get("agent_output")
+    # A pre-reply Action Plan confirmation cannot close collection without its
+    # agreed steps. In that case there is no earlier reply to explain a failed
+    # finalization, so keep this section open and let the router reply normally.
+    if (
+        packet.section_id is SectionID.ACTION_PLAN
+        and confirmation_processed(state)
+        and decision_output is not None
+        and decision_output.is_satisfied is True
+        and len(effective_data.action_items) < 3
+    ):
+        still_open = {
+            key: coerce_section_state(value)
+            for key, value in (state.get("section_states") or {}).items()
+        }
+        active_plan = still_open.get(SectionID.ACTION_PLAN.value) or SectionState(
+            section_id=SectionID.ACTION_PLAN,
+        )
+        still_open[SectionID.ACTION_PLAN.value] = active_plan.model_copy(
+            update={"status": SectionStatus.IN_PROGRESS}
+        )
+        progress = {
+            "section_states": still_open,
+            "should_generate_final_output": False,
+            "finished": False,
+            "router_directive": "stay",
+            "awaiting_satisfaction_feedback": False,
+        }
+        errors.append("Action Plan confirmation needs at least three stored agreed steps")
     sections = progress.get("section_states") or {
         key: coerce_section_state(value)
         for key, value in (state.get("section_states") or {}).items()
@@ -508,6 +547,8 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     errors.extend(persistence_errors)
 
     update = _with_progress(progress, persistence_update)
+    if accepted is not None:
+        update["pending_action_plan"] = None
     # Applied last: on a reopening turn the lifecycle fragment must win over the
     # progress half, which computed `section_states` and the completion flag before
     # extraction revealed that the source data had moved.
@@ -521,3 +562,33 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
         update["error_count"] = state.get("error_count", 0) + 1
 
     return update  # type: ignore[return-value]
+
+
+def _accepted_proposal(
+    state: XBuddyState, packet: ContextPacket, messages: list[BaseMessage],
+) -> list[str] | None:
+    """Promote only explicit confirmation of the exact, immediately prior draft.
+
+    No yes/no string matching; the existing structured decision owns consent.
+    A changed reply, a section revisit, or an unprocessed input cannot accept a
+    stale proposal. Legacy prose drafts still use guarded section extraction.
+    """
+    output = state.get("agent_output")
+    pending = state.get("pending_action_plan")
+    if (
+        packet.section_id is not SectionID.ACTION_PLAN
+        or not confirmation_processed(state)
+        or output is None or output.is_satisfied is not True
+        or output.router_directive not in ("next", "stay")
+        or pending is None or len(messages) < 2
+        or not isinstance(messages[-1], HumanMessage)
+        or not isinstance(messages[-2], AIMessage)
+    ):
+        return None
+    try:
+        pending = PendingActionPlan.model_validate(pending)
+    except ValueError:
+        return None
+    if pending.message_id != messages[-2].id:
+        return None
+    return list(pending.action_items)

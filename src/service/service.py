@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 
@@ -653,6 +654,37 @@ async def invoke(
         raise HTTPException(status_code=500, detail="Unexpected error")
 
 
+async def _read_committed_progress(agent, checkpoint_config, user_id):
+    """Read the exact checkpoint, never a node delta or pending task writes.
+
+    This LangGraph version schedules checkpoint writes asynchronously. A
+    `checkpoints` event alone therefore isn't a durability guarantee. Pin the id
+    (which also disables aget_state's pending-write overlay), and wait briefly
+    until that exact checkpoint is readable. Failure defers to terminal progress.
+    """
+    checkpoint_id = checkpoint_config.get("configurable", {}).get("checkpoint_id")
+    if not checkpoint_id:
+        return None
+
+    async def read():
+        while True:
+            snapshot = await agent.aget_state(config=checkpoint_config)
+            actual_id = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id")
+            values = snapshot.values or {}
+            # Before an async saver commits, aget_state returns an EMPTY snapshot
+            # that echoes the requested config/id. Matching the id alone is not
+            # proof of a saved checkpoint. Wait for its actual values as well.
+            if actual_id == checkpoint_id and values:
+                return public_completion(values) if values.get("user_id") == user_id else None
+            await asyncio.sleep(0.01)
+
+    try:
+        return await asyncio.wait_for(read(), timeout=1.0)
+    except Exception as exc:  # noqa: BLE001 - optional progress read must not abort chat
+        logger.warning(f"[PROGRESS] checkpoint not readable yet; defer projection: {type(exc).__name__}")
+        return None
+
+
 async def message_generator(
     user_input: StreamInput, agent_id: str = DEFAULT_AGENT, request: Request | None = None
 ) -> AsyncGenerator[str, None]:
@@ -684,20 +716,16 @@ async def message_generator(
         except Exception as e:
             logger.warning(f"Failed to subscribe to Realtime for thread {thread_id}: {e}")
 
-    # Get the current thread's message history length to filter out historical messages
-    try:
-        current_state = await agent.aget_state(config=kwargs["config"])
-        initial_message_count = len(current_state.values.get("messages", []))
-        logger.debug(f"Initial message count: {initial_message_count}")
-    except Exception as e:
-        logger.debug(f"Could not get initial message count: {e}")
-        initial_message_count = 0
-
-    sent_message_count = 0  # Track the number of messages sent to prevent duplicates
+    # No pre-stream message count is taken. The counter that used to live here
+    # compared a *cumulative* thread length against a *per-node delta* length, which
+    # are different units; see the `updates` branch below for why that silently
+    # dropped the final turn's readiness message.
 
     # Distinguishes a clean finish from the error path; the completion event is
     # emitted only on the former.
     stream_completed_cleanly = False
+    stream_started = time.monotonic()
+    last_public_progress = None
     try:
         # Send metadata as the first event in the stream
         thread_id = kwargs["config"]["configurable"]["thread_id"]
@@ -707,7 +735,8 @@ async def message_generator(
         
         # Process streamed events from the graph and yield messages over the SSE stream.
         async for stream_event in agent.astream(
-            **kwargs, stream_mode=["updates", "messages", "custom"]
+            **kwargs, stream_mode=["updates", "messages", "custom", "checkpoints"],
+            checkpoint_during=True,
         ):
             # Log stream events efficiently
             if isinstance(stream_event, tuple):
@@ -719,6 +748,19 @@ async def message_generator(
             if not isinstance(stream_event, tuple):
                 continue
             stream_mode, event = stream_event
+            if stream_mode == "checkpoints":
+                candidate = public_completion(event.get("values") or {}).model_dump()
+                if candidate != last_public_progress:
+                    committed = await _read_committed_progress(agent, event.get("config") or {}, user_id)
+                    if committed is not None and committed.model_dump() != last_public_progress:
+                        last_public_progress = committed.model_dump()
+                        logger.info(
+                            f"[PROGRESS] run={run_id} committed+emit "
+                            f"elapsed_ms={(time.monotonic() - stream_started) * 1000:.0f} "
+                            f"next={event.get('next', [])}"
+                        )
+                        yield f"data: {json.dumps({'type': 'completion', 'content': last_public_progress})}\n\n"
+                continue
             new_messages = []
             if stream_mode == "updates":
                 for node, updates in event.items():
@@ -731,22 +773,28 @@ async def message_generator(
                             new_messages.append(AIMessage(content=interrupt.value))
                         continue
                     updates = updates or {}
-                    
-                    # STREAM_FIX: Only send NEW messages (not historical ones)
-                    # Use initial_message_count to filter out messages that were already in the thread
-                    update_messages = updates.get("messages", [])
-                    
-                    # Only add messages that are new (beyond the initial count)
-                    if len(update_messages) > 0:
-                        # If we have an initial count, only take messages after that position
-                        if initial_message_count > 0 and len(update_messages) > initial_message_count:
-                            new_messages.extend(update_messages[initial_message_count:])
-                            logger.debug(f"Sending {len(update_messages[initial_message_count:])} new messages")
-                        # If no initial count or this is the first batch, check against sent_message_count
-                        elif len(update_messages) > sent_message_count:
-                            new_messages.extend(update_messages[sent_message_count:])
-                            sent_message_count = len(update_messages)
-                            logger.debug(f"Sending {len(new_messages)} new messages")
+                    logger.info(
+                        f"[TURN] run={run_id} node={node} returned "
+                        f"elapsed_ms={(time.monotonic() - stream_started) * 1000:.0f}"
+                    )
+
+                    # Under `stream_mode="updates"` this payload is the node's own
+                    # return value, and `messages` carries the `add_messages`
+                    # reducer, so every entry here is a delta the thread has not
+                    # seen. Emit all of them.
+                    #
+                    # The previous filter kept two counters -- the thread's message
+                    # count before the run, and a running total of messages sent --
+                    # and required a node's delta to be *longer* than one of them.
+                    # A turn's second message-producing node therefore always lost:
+                    # `generate_reply` returns one message and sets the running
+                    # total to 1, then `implementation` returns one message and
+                    # fails `1 > 1`. That is exactly the final turn, where
+                    # `implementation` appends the readiness line -- so the message
+                    # was checkpointed, came back from /history on refresh, and had
+                    # never been streamed. Any future node that speaks after
+                    # `generate_reply` would have been swallowed the same way.
+                    new_messages.extend(updates.get("messages", []))
 
             if stream_mode == "custom":
                 new_messages = [event]
@@ -831,6 +879,7 @@ async def message_generator(
         # stream keeps its existing error -> [DONE] shape with nothing synthetic
         # appended.
         stream_completed_cleanly = True
+        logger.info(f"[TURN] run={run_id} graph-finished elapsed_ms={(time.monotonic() - stream_started) * 1000:.0f}")
     except Exception as e:
         import traceback
         logger.error(f"[STREAM ERROR] {str(e)} (run_id={run_id}, agent={agent_id})")
@@ -863,7 +912,8 @@ async def message_generator(
         # Log stream completion
         logger.info(f"[STREAM] Complete: agent={agent_id}, thread={kwargs['config']['configurable']['thread_id'][:8]}...")
         
-        # One terminal structured event, immediately before [DONE], and only on a
+        # A final structured event, even if intermediate checkpoints already sent
+        # progress, immediately before [DONE], and only on a
         # clean finish. Read through the async state API so it reflects everything
         # the turn committed — including an artifact implementation_node wrote in
         # this same turn, which the pre-stream snapshot could not see.

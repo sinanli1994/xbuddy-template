@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import ChatArea, { type CompletionState, type Message } from '@/components/ChatArea';
 import FinalPlanPanel from '@/components/FinalPlanPanel';
@@ -55,6 +55,19 @@ export default function JobBuddyDemo() {
   const [finalPlan, setFinalPlan] = useState<string | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
   const [planOpen, setPlanOpen] = useState(false);
+  const planFetches = useRef(new Set<string>());
+  // Invalidate reads/events from a selection that was deleted or switched away.
+  const selectionVersion = useRef(0);
+  const selectionAtRender = selectionVersion.current;
+
+  useEffect(() => {
+    if (process.env.NODE_ENV === 'development' && completion) {
+      console.debug('[JobBuddy timing] progress-react-commit', {
+        atMs: performance.now(),
+        sections: completion.sections.map(({ id, status }) => ({ id, status })),
+      });
+    }
+  }, [completion]);
 
   /**
    * Restore one thread from the backend.
@@ -72,6 +85,11 @@ export default function JobBuddyDemo() {
    * nothing here can regenerate the plan.
    */
   const loadFinalPlan = useCallback(async (id: DemoIdentity) => {
+    const version = selectionVersion.current;
+    // Intermediate and terminal completion can both announce the same artifact.
+    // Keep this read single-flight; progress itself is never delayed by it.
+    if (planFetches.current.has(id.threadId)) return;
+    planFetches.current.add(id.threadId);
     setPlanError(null);
     try {
       const response = await fetch('/api/final-output', {
@@ -87,14 +105,19 @@ export default function JobBuddyDemo() {
       };
       // Never claim a plan the backend did not return. If it says unavailable, that
       // is the answer, even when completion said otherwise a moment ago.
+      if (version !== selectionVersion.current) return;
       setFinalPlan(data.artifact_available ? data.final_output : null);
     } catch (error) {
+      if (version !== selectionVersion.current) return;
       setPlanError(error instanceof Error ? error.message : 'Could not load the final plan');
       setFinalPlan(null);
+    } finally {
+      planFetches.current.delete(id.threadId);
     }
   }, []);
 
   const restore = useCallback(async (id: DemoIdentity) => {
+    const version = selectionVersion.current;
     setRestoreState('loading');
     setRestoreError(null);
 
@@ -131,9 +154,9 @@ export default function JobBuddyDemo() {
           role: m.type === 'human' ? ('user' as const) : ('assistant' as const),
           content: m.content,
         }));
-      setLoadedMessages(restored);
-
       const completionData = (await completionResponse.json()) as CompletionState;
+      if (version !== selectionVersion.current) return;
+      setLoadedMessages(restored);
       setCompletion(
         Array.isArray(completionData.sections) && completionData.sections.length > 0
           ? completionData
@@ -160,6 +183,7 @@ export default function JobBuddyDemo() {
 
       setRestoreState('ready');
     } catch (error) {
+      if (version !== selectionVersion.current) return;
       // A failed restore must not look like an empty conversation, or the user would
       // silently start talking over history they cannot see.
       setRestoreError(error instanceof Error ? error.message : 'Could not load your conversation');
@@ -172,15 +196,19 @@ export default function JobBuddyDemo() {
     // being viewed, so a refresh fell back to whichever identity was written last —
     // always the newest conversation, never the one on screen.
     const id = resolveActiveIdentity();
+    selectionVersion.current += 1;
     setIdentity(id);
     setConversations(listConversations());
-    void restore(id);
+    if (id) void restore(id);
+    else setRestoreState('ready');
+    return () => { selectionVersion.current += 1; };
   }, [restore]);
 
   /** Adopt a thread locally. No network call — the caller decides whether to restore. */
-  const selectLocally = (id: DemoIdentity) => {
+  const selectLocally = (id: DemoIdentity | null) => {
+    selectionVersion.current += 1;
     setIdentity(id);
-    setActiveThreadId(id.threadId);
+    setActiveThreadId(id?.threadId ?? null);
     setLoadedMessages([]);
     setCompletion(null);
     setCurrentSection(null);
@@ -202,6 +230,19 @@ export default function JobBuddyDemo() {
     setRestoreState('ready');
     setConversations(listConversations());
   };
+
+  const handleFirstUserMessage = useCallback((content: string) => {
+    if (!identity) return;
+    // Metadata only: the transcript remains exclusively in the backend checkpoint.
+    // rememberConversation changes a fallback label once and preserves it forever
+    // after that, so later messages cannot rename the thread.
+    rememberConversation(
+      identity.threadId,
+      identity.userId,
+      titleFromFirstMessage(content),
+    );
+    setConversations(listConversations());
+  }, [identity]);
 
   const handleSelectConversation = (conversation: DemoConversation) => {
     if (conversation.threadId === identity?.threadId) return;
@@ -231,12 +272,9 @@ export default function JobBuddyDemo() {
       return;
     }
 
-    // Nothing left: a fresh empty thread, which shows onboarding. Still no model call.
-    const fresh = mintIdentity();
-    rememberConversation(fresh.threadId, fresh.userId);
-    selectLocally(fresh);
+    // Nothing left means no selection, not a new conversation.
+    selectLocally(null);
     setRestoreState('ready');
-    setConversations(listConversations());
   };
 
   return (
@@ -336,11 +374,15 @@ export default function JobBuddyDemo() {
             onThreadIdChange={() => {
               /* the demo mints its own thread id, so the backend echo is a no-op */
             }}
-            onSectionUpdate={setCurrentSection}
+            onSectionUpdate={(next) => {
+              if (selectionAtRender === selectionVersion.current) setCurrentSection(next);
+            }}
+            onFirstUserMessage={handleFirstUserMessage}
             onCompletionUpdate={(next) => {
+              if (selectionAtRender !== selectionVersion.current) return;
               setCompletion(next);
-              // The terminal completion event is the first moment a just-finished
-              // plan exists. Fetch it once, and only then.
+              // Every event is the latest committed public projection. A plan
+              // read is allowed only once an event reports artifact availability.
               if (next.artifact_available && !finalPlan) {
                 void loadFinalPlan(identity);
               }
@@ -357,7 +399,9 @@ export default function JobBuddyDemo() {
               fontSize: 14,
             }}
           >
-            Loading your conversation…
+            {restoreState === 'loading'
+              ? 'Loading your conversation…'
+              : 'Choose “Start a new conversation” in the sidebar to begin.'}
           </div>
         )}
       </main>

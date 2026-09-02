@@ -5,9 +5,11 @@ reach the chat, and everything the model is not trusted with is computed here.
 
 What the model decides, and what it does not
 --------------------------------------------
-The model returns a `FinalOutputDraft`. Two fields of the real artifact are absent
+The model returns a `FinalOutputDraft`. Three fields of the real artifact are absent
 from that schema on purpose:
 
+* **`headline`** — derived from collected roles and explicit focus. A neutral
+  career-plan title is safer than guessing that every goal is a career change.
 * **`action_items`** — assembled by `assemble_final_output` from the confirmed
   Action Plan plus the model's annotations. The step text is never part of the
   model's output, so "preserved exactly" is a property of the type rather than a
@@ -38,6 +40,7 @@ from typing import Any
 
 from langchain_core.messages import SystemMessage
 
+from .career_title import career_plan_title
 from .context import _FIELD_LABELS
 from .models import (
     ActionItem,
@@ -235,7 +238,7 @@ def assemble_final_output(
 
     try:
         final_output = FinalOutput(
-            headline=draft.headline,
+            headline=career_plan_title(user_data),
             positioning_summary=draft.positioning_summary,
             strengths_to_leverage=draft.strengths_to_leverage,
             skill_priorities=draft.skill_priorities,

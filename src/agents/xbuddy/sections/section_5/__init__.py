@@ -42,6 +42,9 @@ happy with it. This completes the last section, so the summary should read like
 something they can act on immediately.
 """
 
+# Proposal-mode output is enforced in action_plan.py; transition ownership is
+# enforced by the graph before this template is used.
+
 SECTION_5_TEMPLATE = SectionTemplate(
     section_id=SectionID.ACTION_PLAN,
     name="Action Plan",

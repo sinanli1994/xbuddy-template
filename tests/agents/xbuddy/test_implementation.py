@@ -54,7 +54,6 @@ class CountingChain:
 
 def draft(steps=CONFIRMED) -> FinalOutputDraft:
     return FinalOutputDraft(
-        headline="QA Analyst to Senior SRE within 3 months",
         positioning_summary="Four years of QA moving into automation.",
         strengths_to_leverage=["systems debugging"],
         skill_priorities=["Kubernetes"],
@@ -123,7 +122,7 @@ async def test_final_output_is_rendered_markdown_not_structured_json(chain):
     update = await implementation_node(eligible_state(), {})
     markdown = update["final_output"]
 
-    assert markdown.startswith("# QA Analyst to Senior SRE within 3 months")
+    assert markdown.startswith("# Transition from QA Analyst to Senior SRE\n")
     assert "## Your Action Plan" in markdown
     assert "## What I Still Don't Know" in markdown
     # Not a serialized model: no JSON braces, no schema field names.

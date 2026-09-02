@@ -440,7 +440,6 @@ def complete_data(**overrides) -> XBuddyData:
 
 def draft() -> FinalOutputDraft:
     return FinalOutputDraft(
-        headline="QA Analyst to Senior SRE",
         positioning_summary="Four years of QA moving into automation.",
         strengths_to_leverage=[],
         skill_priorities=[],

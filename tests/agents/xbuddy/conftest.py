@@ -18,6 +18,24 @@ from agents.xbuddy.models import SectionDecision, XBuddyData
 from agents.xbuddy.state_factory import build_initial_state
 
 
+@pytest.fixture(autouse=True)
+def no_unmocked_model_calls(monkeypatch):
+    """A fake API key is not isolation: block any forgotten model seam locally.
+
+    Assert at teardown too, since production nodes intentionally catch failures.
+    Tests that exercise model construction may replace this with their own fake.
+    """
+    attempts = []
+
+    def blocked(*args, **kwargs):
+        attempts.append(True)
+        raise AssertionError("Unmocked model call: supply a deterministic test double")
+
+    monkeypatch.setattr("core.llm.get_model", blocked)
+    yield
+    assert not attempts, "A node attempted an unmocked model call (blocked locally)"
+
+
 class RecordingModel:
     """Stands in for the chat model in generate_reply."""
 

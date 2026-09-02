@@ -42,10 +42,10 @@ logger = logging.getLogger(__name__)
 # Tag the service uses to keep this call's tokens out of the user's stream.
 INTERNAL_DECISION_TAG = "internal_decision"
 
-# Replies the agent may produce for a single user message before the decision
-# node stops asking the model and forces `stay`. Two allows the intended
-# "finish a section, greet the next" turn without letting the
-# reply -> decision -> memory_updater -> router loop run away.
+# Last-resort recursion guard. Normal turn semantics in graph/routes.py end the
+# invocation after the first AI reply, while still letting the second router pass
+# advance structured section state. Keeping this at two limits damage if that
+# routing invariant ever regresses; it does not authorize a second visible reply.
 MAX_REPLIES_PER_TURN = 2
 
 DECISION_WINDOW_SIZE = 10

@@ -42,6 +42,9 @@ COLD_DEFAULTS: dict[str, Callable[[], Any]] = {
     "agent_output": lambda: None,
     "awaiting_user_input": lambda: False,
     "awaiting_satisfaction_feedback": lambda: False,
+    "confirmation_processed_id": lambda: None,
+    "reply_intent": lambda: "CONVERSE",
+    "pending_action_plan": lambda: None,
     # Error tracking
     "error_count": lambda: 0,
     "last_error": lambda: None,

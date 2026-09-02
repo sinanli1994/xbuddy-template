@@ -152,6 +152,13 @@ async def router_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState
         draft=active.content,
         user_data=state.get("user_data") or XBuddyData(),
     )
+    data = state.get("user_data") or XBuddyData()
+    update["reply_intent"] = (
+        "PROPOSE_FIRST_DRAFT"
+        if section is SectionID.ACTION_PLAN and not data.action_items
+        and not state.get("awaiting_satisfaction_feedback", False)
+        else "CONVERSE"
+    )
 
     logger.info(
         "Router: directive=%r section=%s status=%s finished=%s",

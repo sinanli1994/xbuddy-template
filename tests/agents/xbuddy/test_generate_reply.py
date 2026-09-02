@@ -112,3 +112,6 @@ async def test_satisfaction_overlay_applied_only_when_awaiting(reply_model, make
         assert SATISFACTION_OVERLAY.strip() in prompt
         # The section's own prompt survives; the overlay is additive.
         assert state["context_packet"].system_prompt in prompt
+
+
+# Structured proposal and transition regressions: test_action_plan_workflow.py.

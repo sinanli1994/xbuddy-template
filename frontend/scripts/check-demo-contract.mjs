@@ -16,7 +16,13 @@ import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const read = (p) => readFileSync(join(ROOT, p), 'utf8');
+// Line endings are normalized on read. Without this the comment stripper below
+// silently gives up on a CRLF working tree: the `.` in its `//.*$` excludes
+// carriage returns, so on CRLF input entire comments survive stripping
+// and every "this word must not appear in the source" check reads prose as code.
+// Git hands out CRLF on Windows checkouts, so which branch you are on decided
+// whether these checks meant anything.
+const read = (p) => readFileSync(join(ROOT, p), 'utf8').replace(/\r\n/g, '\n');
 
 /**
  * Source with comments stripped.
@@ -238,6 +244,7 @@ check('the history route exists', existsSync(join(ROOT, 'src/app/api/history/rou
 // ------------------------------------------- Phase 1.1: one bubble, real streaming ----
 
 const chatAreaCode = code('src/components/ChatArea.tsx');
+const chatScrollCode = code('src/utils/chatScroll.ts');
 
 check(
   'no standalone Thinking/Processing card',
@@ -452,8 +459,28 @@ check(
 );
 check(
   'auto-scroll cannot move the document',
-  chatAreaCode.includes("block: 'nearest'"),
-  'scrollIntoView otherwise scrolls every scrollable ancestor, including the page'
+  !chatAreaCode.includes('scrollIntoView') &&
+    chatAreaCode.includes('messagesPaneRef.current') &&
+    chatAreaCode.includes('pane.scrollTo'),
+  'only the message pane is addressed; document ancestors are never scrolled'
+);
+check(
+  'streamed tokens never restart smooth scrolling',
+  chatScrollCode.includes("return isNearBottom ? 'auto' : null") &&
+    (chatScrollCode.match(/return 'smooth'/g) ?? []).length === 1,
+  'token growth follows directly only while the reader remains near the bottom'
+);
+check(
+  'manual upward scrolling disables auto-follow',
+  chatAreaCode.includes('onScroll={(event)') &&
+    chatAreaCode.includes('isNearBottomRef.current = isNearChatBottom(pane)') &&
+    chatAreaCode.includes("trigger === 'stream-token' && !isNearBottomRef.current"),
+  'the live ref is checked again inside the animation frame'
+);
+check(
+  'new user messages still receive one smooth reveal',
+  chatAreaCode.includes("scheduleChatScroll('new-user-message')") &&
+    chatScrollCode.includes("if (trigger === 'new-user-message') return 'smooth'")
 );
 
 // -------------------------------------------------------- sidebar hierarchy ----
@@ -475,8 +502,8 @@ check(
   idxNew > -1 && idxRecent > -1 && idxNew < idxRecent
 );
 check(
-  'status and developer details come last',
-  idxRecent < idxStatus && idxStatus < idxDev
+  'completion stays with progress and developer details stay last',
+  idxProgress < idxStatus && idxStatus < idxNew && idxRecent < idxDev
 );
 check(
   'the new-conversation button is not bottom-pinned',
@@ -573,8 +600,9 @@ check(
   re('resolveActiveIdentity[^]{0,700}list.length > 0[^]{0,200}setActiveThreadId').test(convCode)
 );
 check(
-  'an empty list mints a fresh thread rather than failing',
-  re('resolveActiveIdentity[^]{0,900}mintIdentity[(][)]').test(convCode)
+  'an empty list stays empty on reload',
+  !convCode.slice(convCode.indexOf('export function resolveActiveIdentity')).includes('mintIdentity()') &&
+    convCode.slice(convCode.indexOf('export function resolveActiveIdentity')).includes('return null;')
 );
 check(
   'selecting a conversation persists the new active thread',
@@ -605,10 +633,10 @@ check(
   'it returns before touching the active identity'
 );
 check(
-  'deleting the active conversation selects a valid fallback',
+  'deleting the active conversation selects an existing fallback or nothing',
   re('handleDeleteConversation[^]{0,1200}remaining.length > 0[^]{0,300}restore[(]').test(page14) &&
-    re('handleDeleteConversation[^]{0,1600}mintIdentity[(][)]').test(page14),
-  'another record if one remains, otherwise a fresh empty thread'
+    re('handleDeleteConversation[^]{0,1600}selectLocally[(]null[)]').test(page14),
+  'another record if one remains, otherwise no conversation'
 );
 check(
   'deletion never calls the chat endpoint',
@@ -645,6 +673,22 @@ check(
 check(
   'there is a fallback title for an unusable first message',
   convCode.includes("FALLBACK_TITLE = 'New Career Conversation'")
+);
+check(
+  'the first user message updates conversation metadata immediately',
+  chatAreaCode.includes('onFirstUserMessage?.(userMessage.content)') &&
+    pageCode13.includes('onFirstUserMessage={handleFirstUserMessage}') &&
+    re('handleFirstUserMessage[^]{0,500}titleFromFirstMessage[(]content[)][^]{0,250}setConversations[(]listConversations[(][)][)]').test(pageCode13),
+  'ChatArea reports the event; the parent that owns metadata updates the list'
+);
+check(
+  'first-message title timing adds no model or network call',
+  !re('handleFirstUserMessage[^]{0,700}(fetch[(]|/api/|openai|llm)').test(pageCode13)
+);
+check(
+  'ChatArea does not own localStorage',
+  !chatAreaCode.includes('localStorage'),
+  'conversation metadata remains owned by the parent utility boundary'
 );
 
 // -------------------------------------------------------------- onboarding ----
@@ -740,19 +784,22 @@ check(
   'normal flow, so each block lands after the one before it'
 );
 
-// Lower blocks must follow the list in document order, not be layered over it.
+// Workflow completion belongs inside progress, before navigation/history.
 const idxList15 = prog15.indexOf('Recent Conversations');
 const idxStatus15 = prog15.indexOf('Final Plan');
 const idxDev15 = prog15.indexOf('Developer Details');
 const idxNew15 = prog15.indexOf('Start a new conversation');
 const idxProg15 = prog15.indexOf('Your Progress');
+const idxCollection15 = prog15.indexOf('label="Collection"');
+const idxView15 = prog15.indexOf('View Final Plan');
 
 check(
-  'status and developer details follow the conversation list in normal flow',
-  idxList15 > -1 && idxList15 < idxStatus15 && idxStatus15 < idxDev15
+  'completion and final-plan action precede navigation; developer details stay last',
+  idxCollection15 > idxProg15 && idxCollection15 < idxStatus15 && idxStatus15 < idxView15 &&
+    idxView15 < idxNew15 && idxList15 < idxDev15
 );
 check(
-  'the agreed hierarchy is unchanged',
+  'progress including completion precedes new conversation and recent conversations',
   idxProg15 < idxNew15 && idxNew15 < idxList15,
   'progress, then new conversation, then recent conversations'
 );
@@ -1010,6 +1057,81 @@ check(
   SOURCE_REL.every((f) => !re('\\bfinished\\b').test(sourceCode(f)))
 );
 
+
+// ------------------------------------------------- live / history parity ----
+//
+// A turn can persist more than one assistant message. `implementation` appends a
+// readiness line with no model call behind it, so it arrives as a `message` event
+// and never as tokens. ChatArea used to discard every `message` event outright,
+// which meant that line showed up only after F5 — the transcript changed under the
+// user on refresh.
+//
+// These read the streaming branch of ChatArea. They can prove the handler is wired
+// and deduped; they cannot prove what renders. The manual checklist covers that.
+
+const chatAreaParity = sourceCode('src/components/ChatArea.tsx');
+const streamRule = sourceCode('src/utils/chatStream.ts');
+const messageBranch = (() => {
+  const start = chatAreaParity.indexOf("parsed.type === 'message'");
+  if (start === -1) return '';
+  const next = chatAreaParity.indexOf("parsed.type === 'section'", start);
+  return chatAreaParity.slice(start, next === -1 ? chatAreaParity.length : next);
+})();
+
+check(
+  'ChatArea handles the `message` SSE event at all',
+  messageBranch.length > 0
+);
+
+check(
+  'the decision lives in a rule a probe can run',
+  re('planMessageEvent').test(messageBranch) && re('planMessageEvent').test(streamRule),
+  'inline in the component it could only be checked by reading the source'
+);
+
+check(
+  'both outcomes are wired up',
+  re("'fill-placeholder'").test(messageBranch) && re("'append-bubble'").test(messageBranch),
+  'an unhandled outcome silently drops the message again'
+);
+
+check(
+  'an extra assistant message gets its own bubble id',
+  re('extra-\\$\\{extraBubbleCount\\}').test(messageBranch),
+  'reusing the streamed bubble id would overwrite the reply'
+);
+
+check(
+  'the rule drops a message already streamed as tokens',
+  re('accumulated').test(streamRule),
+  'without this the reply appears twice: once from tokens, once from the event'
+);
+
+check(
+  'only assistant messages become bubbles',
+  re("!== 'ai'").test(streamRule)
+);
+
+// ------------------------------------------------------ title heuristics ----
+
+const titleRules = sourceCode('src/utils/demoConversations.ts');
+
+check(
+  'the title rules cut at a qualifying clause',
+  re('QUALIFIER_BOUNDARIES').test(titleRules) && re('focused on').test(titleRules),
+  '"...role focused on X" used to title as "Targeting AI Engineer Role Focused"'
+);
+
+check(
+  'a title cannot end on a dangling participle',
+  re('DANGLING_TAIL').test(titleRules)
+);
+
+check(
+  'titles still need no model call',
+  !re('fetch\\(|/api/').test(titleRules),
+  'naming a conversation is deterministic and local by design'
+);
 
 // ----------------------------------------------------------------- report ----
 
