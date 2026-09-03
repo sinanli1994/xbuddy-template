@@ -14,6 +14,7 @@
     "check:layout": "npx tsx scripts/sidebar-layout-probe.tsx",
     "check:reveal": "npx tsx scripts/text-reveal-probe.ts",
     "check:streaming": "node scripts/streaming-probe.mjs",
+    "check:sse-split": "node scripts/sse-split-probe.mjs",
     "check:parity": "npx tsx scripts/stream-parity-probe.ts"
   },
   "dependencies": {
