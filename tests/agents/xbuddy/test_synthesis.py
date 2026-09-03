@@ -62,7 +62,6 @@ def annotation(step_number=1, rationale="Closes the biggest gap", timeframe=None
 
 def draft(**overrides) -> FinalOutputDraft:
     values = {
-        "headline": "QA Analyst to Senior SRE within 3 months",
         "positioning_summary": "Four years of QA moving into automation.",
         "strengths_to_leverage": ["systems debugging"],
         "skill_priorities": ["Kubernetes"],
@@ -275,6 +274,7 @@ def test_draft_schema_excludes_the_fields_the_model_must_not_author():
     """`unknowns` is derived and `action_items` is assembled — neither is offerable."""
     fields = set(FinalOutputDraft.model_fields)
     assert "unknowns" not in fields
+    assert "headline" not in fields
     assert "action_items" not in fields
     assert "action_annotations" in fields
 
@@ -425,7 +425,6 @@ def test_assembly_never_raises_even_on_a_draft_that_bypassed_validation():
     """
     forged = ActionAnnotation.model_construct(step_number=1, rationale="   ", timeframe=None)
     bad = FinalOutputDraft.model_construct(
-        headline="h",
         positioning_summary="p",
         strengths_to_leverage=[],
         skill_priorities=[],
@@ -448,7 +447,6 @@ def test_assembly_reports_a_missing_annotation_number():
         ActionAnnotation.model_construct(step_number=3, rationale="b", timeframe=None),
     ]
     bad = FinalOutputDraft.model_construct(
-        headline="h",
         positioning_summary="p",
         strengths_to_leverage=[],
         skill_priorities=[],

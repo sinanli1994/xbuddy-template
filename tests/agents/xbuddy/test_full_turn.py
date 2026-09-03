@@ -100,6 +100,7 @@ class FakeExtractionChain:
 
 
 def _patch_graph(monkeypatch, decision):
+    from agents.xbuddy import action_plan
     from agents.xbuddy.agent import graph
     from agents.xbuddy.nodes import generate_decision as decision_module
     from agents.xbuddy.nodes import generate_reply as reply_module
@@ -113,6 +114,11 @@ def _patch_graph(monkeypatch, decision):
     monkeypatch.setattr(reply_module, "_reply_model", lambda: fakes["reply"])
     monkeypatch.setattr(decision_module, "_decision_chain", lambda: fakes["decision"])
     monkeypatch.setattr(memory_module, "_extraction_chain", fakes["extraction"].build)
+    # Old routing tests do not exercise proposals; never let the new branch dial
+    # a real model. Dedicated workflow tests install a structured fake instead.
+    def no_proposal_model():
+        raise AssertionError("unexpected proposal model in legacy routing fixture")
+    monkeypatch.setattr(action_plan, "_proposal_chain", no_proposal_model)
     return graph, fakes
 
 
@@ -287,14 +293,12 @@ async def test_decision_tokens_are_all_tagged(graph_with_fakes):
 
 @pytest.mark.asyncio
 async def test_next_happy_model_still_terminates(graph_with_fakes_next):
-    """Nothing marks a section DONE in PR 3, so `next` cannot advance. Without
-    the reply cap this would loop until recursion_limit and raise.
+    """A navigation directive never authorizes a second reply in the same turn.
 
-    With the cap the turn is exactly 10 super-steps:
-      initialize, router, reply, decision, memory_updater,
-      router, reply, decision, memory_updater, router -> END
-    The limit below is set just above that, so an uncapped loop would still fail
-    here while the capped one passes.
+    Nothing marks a section DONE in this fixture, so `next` cannot advance. The
+    post-memory router still runs, but it sees the AI reply and ends the turn.
+    Reverting that guard makes this produce two replies before the legacy cap
+    stops it, reproducing the production failure.
     """
     graph, fakes = graph_with_fakes_next
     config = make_config()
@@ -305,10 +309,10 @@ async def test_next_happy_model_still_terminates(graph_with_fakes_next):
     )
     values = (await graph.aget_state(config)).values
 
-    # Two replies (the cap), then the turn ends on a forced stay.
-    assert fakes["reply"].call_count == 2
-    assert values["router_directive"] == "stay"
-    assert len([m for m in values["messages"] if isinstance(m, AIMessage)]) == 2
+    assert fakes["reply"].call_count == 1
+    assert fakes["decision"].call_count == 1
+    assert values["router_directive"] == "next"
+    assert len([m for m in values["messages"] if isinstance(m, AIMessage)]) == 1
 
 
 # --------------------------------------------------------------------------
@@ -324,7 +328,7 @@ async def test_satisfied_career_goal_progresses_to_background(graph_with_satisfi
     get_next_unfinished_section for the next section and got the *same* one back
     forever. With the DONE transition in place the router genuinely advances.
     """
-    graph, _ = graph_with_satisfied_next
+    graph, fakes = graph_with_satisfied_next
     config = make_config()
 
     await graph.ainvoke(
@@ -338,6 +342,9 @@ async def test_satisfied_career_goal_progresses_to_background(graph_with_satisfi
         "a satisfied Career Goal must hand off to Background"
     )
     assert values["section_states"]["background"].status is SectionStatus.IN_PROGRESS
+    assert fakes["reply"].call_count == 1, "one user input must produce one visible reply"
+    assert fakes["decision"].call_count == 1
+    assert len([m for m in values["messages"] if isinstance(m, AIMessage)]) == 1
     # The remaining three are untouched.
     for section in (SectionID.JOB_PREFERENCES, SectionID.SKILL_ASSESSMENT, SectionID.ACTION_PLAN):
         assert values["section_states"][section.value].status is SectionStatus.PENDING
@@ -347,8 +354,40 @@ async def test_satisfied_career_goal_progresses_to_background(graph_with_satisfi
 
 
 @pytest.mark.asyncio
+async def test_satisfied_transition_streams_exactly_one_reply(graph_with_satisfied_next):
+    """Exact streaming regression for Career Goal -> Background.
+
+    The fake chat model emits one-character chunks. If NEXT re-enters
+    generate_reply, the reconstructed text and call count both double, matching
+    the two concatenated replies observed in the browser.
+    """
+    graph, fakes = graph_with_satisfied_next
+    incremental: list[str] = []
+
+    async for mode, event in graph.astream(
+        {"messages": [HumanMessage(content="yes, that's right")]},
+        {**make_config(), "recursion_limit": 12},
+        stream_mode=["messages"],
+    ):
+        if mode != "messages":
+            continue
+        message, metadata = event
+        if metadata.get("langgraph_node") != "generate_reply":
+            continue
+        if isinstance(message.content, str) and len(message.content) == 1:
+            incremental.append(message.content)
+
+    assert "".join(incremental) == REPLY_TEXT
+    assert fakes["reply"].call_count == 1
+
+
+# Same-turn Action Plan coverage lives in test_action_plan_workflow.py.
+
+
+
+@pytest.mark.asyncio
 async def test_fifth_section_completion_reaches_implementation_without_raising(
-    graph_with_satisfied_next,
+    graph_with_satisfied_next, monkeypatch,
 ):
     """route_after_memory_updater sends the turn to implementation_node here.
 
@@ -356,6 +395,7 @@ async def test_fifth_section_completion_reaches_implementation_without_raising(
     completing the final section would have taken the whole turn down.
     """
     graph, _ = graph_with_satisfied_next
+    _patch_synthesis(monkeypatch, PLAN)
     config = make_config()
 
     four_done = {
@@ -374,6 +414,8 @@ async def test_fifth_section_completion_reaches_implementation_without_raising(
     await graph.ainvoke(
         {
             "messages": [HumanMessage(content="yes, ship it")],
+            "user_data": XBuddyData(action_items=PLAN),
+            "awaiting_satisfaction_feedback": True,
             "section_states": four_done,
             "current_section": SectionID.ACTION_PLAN,
             "router_directive": "stay",
@@ -414,7 +456,6 @@ def _patch_synthesis(monkeypatch, steps):
             self.calls += 1
             return {
                 "parsed": FinalOutputDraft(
-                    headline="QA Analyst to Senior SRE",
                     positioning_summary="Four years of QA moving into automation.",
                     strengths_to_leverage=["systems debugging"],
                     skill_priorities=["Kubernetes"],
@@ -483,7 +524,8 @@ async def test_completing_the_fifth_section_generates_the_artifact(
     values = (await graph.aget_state(config)).values
 
     assert chain.calls == 1
-    assert values["final_output"].startswith("# QA Analyst to Senior SRE")
+    # This seed has no current role: the title must not invent QA Analyst.
+    assert values["final_output"].startswith("# Senior SRE Career Plan\n")
     assert "## Your Action Plan" in values["final_output"]
     assert "## What I Still Don\'t Know" in values["final_output"]
     # The shared graph fixture's extraction fake reports a parsing error by design,

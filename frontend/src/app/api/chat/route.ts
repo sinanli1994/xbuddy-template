@@ -223,6 +223,8 @@ export async function POST(req: Request) {
         const STREAM_TIMEOUT = 30000; // 30 second timeout
         let timeoutId: NodeJS.Timeout | null = null;
         let isClosed = false; // Flag to prevent duplicate close
+        let carry = '';
+        let eventDataLines: string[] = [];
 
         // Safely write data
         const safeEnqueue = (data: Uint8Array) => {
@@ -297,6 +299,100 @@ export async function POST(req: Request) {
           return;
         }
 
+        // Dispatch only complete SSE events. A reader.read() boundary is an
+        // arbitrary transport boundary and may occur anywhere inside a data line.
+        // `carry` preserves that partial line; the blank line is the SSE event
+        // boundary. This remains incremental and never buffers the full response.
+        const dispatchEvent = (): boolean => {
+          if (eventDataLines.length === 0) return false;
+          const data = eventDataLines.join('\n');
+          eventDataLines = [];
+
+          if (data === '[DONE]') {
+            const finalResponseData = {
+              type: 'final_response',
+              content: finalContent,
+              threadId: finalThreadId,
+              userId: finalUserId_response || finalUserId,
+              section: finalSection
+            };
+
+            logApiCall('STREAM_SENDING_FINAL', {
+              timestamp: new Date().toISOString(),
+              requestId: `req_${requestStartTime}`,
+              finalData: {
+                contentLength: finalContent.length,
+                threadId: finalThreadId,
+                userId: finalUserId_response || finalUserId,
+                hasSection: !!finalSection,
+                totalTokens: tokenCount,
+                totalChunks: chunkCount
+              }
+            });
+
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify(finalResponseData)}\n\n`));
+            safeEnqueue(encoder.encode('data: [DONE]\n\n'));
+            safeClose();
+            return true;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+
+            logApiCall('STREAM_DATA_PARSED', {
+              timestamp: new Date().toISOString(),
+              requestId: `req_${requestStartTime}`,
+              parsedData: {
+                type: parsed.type,
+                contentLength: parsed.content?.length || 0,
+                hasRunId: !!parsed.content?.run_id,
+                hasCustomData: !!parsed.content?.custom_data,
+                rawDataSample: data.substring(0, 100) + (data.length > 100 ? '...' : '')
+              }
+            });
+
+            if (parsed.type === 'token') {
+              tokenCount++;
+              finalContent += parsed.content;
+            } else if (parsed.type === 'message') {
+              finalContent = parsed.content.content || finalContent;
+              if (parsed.content.run_id) finalThreadId = parsed.content.run_id;
+              if (parsed.content.custom_data) {
+                finalSection = parsed.content.custom_data.section;
+                finalUserId_response = parsed.content.custom_data.user_id;
+              }
+            } else if (parsed.type === 'section') {
+              finalSection = parsed.content;
+            }
+
+            // Preserve the existing public contract: validated events are
+            // reconstructed and forwarded, rather than blindly proxying bytes.
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
+          } catch (e) {
+            logApiCall('STREAM_PARSE_ERROR', {
+              timestamp: new Date().toISOString(),
+              requestId: `req_${requestStartTime}`,
+              parseError: {
+                error: e instanceof Error ? e.message : 'Unknown parse error',
+                rawData: data,
+                chunkNumber: chunkCount
+              }
+            }, 'WARN');
+            console.error('Failed to parse stream data:', e, data);
+          }
+          return false;
+        };
+
+        const processLine = (rawLine: string): boolean => {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+          if (line === '') return dispatchEvent();
+          if (line.startsWith('data:')) {
+            const value = line.slice(5);
+            eventDataLines.push(value.startsWith(' ') ? value.slice(1) : value);
+          }
+          return false;
+        };
+
         try {
           while (true) {
             const readStart = Date.now();
@@ -304,6 +400,10 @@ export async function POST(req: Request) {
             const readTime = Date.now() - readStart;
             
             if (done) {
+              carry += decoder.decode();
+              if (carry && processLine(carry)) return;
+              carry = '';
+              if (eventDataLines.length > 0 && dispatchEvent()) return;
               logApiCall('STREAM_COMPLETE', {
                 timestamp: new Date().toISOString(),
                 requestId: `req_${requestStartTime}`,
@@ -321,8 +421,9 @@ export async function POST(req: Request) {
             chunkCount++;
             lastActivityTime = Date.now();
             resetTimeout(); // Reset timeout timer
-            const chunk = decoder.decode(value, { stream: true });
+            const chunk = carry + decoder.decode(value, { stream: true });
             const lines = chunk.split('\n');
+            carry = lines.pop() ?? '';
 
             logApiCall('STREAM_CHUNK_RECEIVED', {
               timestamp: new Date().toISOString(),
@@ -338,85 +439,7 @@ export async function POST(req: Request) {
             });
 
             for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') {
-                  // Send final complete response data
-                  const finalResponseData = {
-                    type: 'final_response',
-                    content: finalContent,
-                    threadId: finalThreadId,
-                    userId: finalUserId_response || finalUserId,
-                    section: finalSection
-                  };
-                  
-                  logApiCall('STREAM_SENDING_FINAL', {
-                    timestamp: new Date().toISOString(),
-                    requestId: `req_${requestStartTime}`,
-                    finalData: {
-                      contentLength: finalContent.length,
-                      threadId: finalThreadId,
-                      userId: finalUserId_response || finalUserId,
-                      hasSection: !!finalSection,
-                      totalTokens: tokenCount,
-                      totalChunks: chunkCount
-                    }
-                  });
-                  
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(finalResponseData)}\n\n`));
-                  safeEnqueue(encoder.encode('data: [DONE]\n\n'));
-                  safeClose();
-                  return;
-                }
-
-                try {
-                  const parsed = JSON.parse(data);
-                  
-                  logApiCall('STREAM_DATA_PARSED', {
-                    timestamp: new Date().toISOString(),
-                    requestId: `req_${requestStartTime}`,
-                    parsedData: {
-                      type: parsed.type,
-                      contentLength: parsed.content?.length || 0,
-                      hasRunId: !!parsed.content?.run_id,
-                      hasCustomData: !!parsed.content?.custom_data,
-                      rawDataSample: data.substring(0, 100) + (data.length > 100 ? '...' : '')
-                    }
-                  });
-                  
-                  // Handle different types of streaming data
-                  if (parsed.type === 'token') {
-                    tokenCount++;
-                    finalContent += parsed.content;
-                  } else if (parsed.type === 'message') {
-                    finalContent = parsed.content.content || finalContent;
-                    if (parsed.content.run_id) {
-                      finalThreadId = parsed.content.run_id;
-                    }
-                    if (parsed.content.custom_data) {
-                      finalSection = parsed.content.custom_data.section;
-                      finalUserId_response = parsed.content.custom_data.user_id;
-                    }
-                  } else if (parsed.type === 'section') {
-                    finalSection = parsed.content;
-                  }
-                  
-                  // Forward streaming data
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`));
-                } catch (e) {
-                  logApiCall('STREAM_PARSE_ERROR', {
-                    timestamp: new Date().toISOString(),
-                    requestId: `req_${requestStartTime}`,
-                    parseError: {
-                      error: e instanceof Error ? e.message : 'Unknown parse error',
-                      rawData: data,
-                      chunkNumber: chunkCount,
-                      lineNumber: lines.indexOf(line)
-                    }
-                  }, 'WARN');
-                  console.error('Failed to parse stream data:', e, data);
-                }
-              }
+              if (processLine(line)) return;
             }
           }
         } catch (error) {

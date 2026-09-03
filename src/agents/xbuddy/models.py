@@ -3,7 +3,7 @@
 Reference: https://github.com/Victoria824/FounderBuddy/blob/main/src/agents/founder_buddy/models.py
 """
 
-from typing import Any, NotRequired
+from typing import Any, Literal, NotRequired
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import MessagesState
@@ -308,7 +308,7 @@ class FinalOutput(BaseModel):
     """
 
     headline: str = Field(
-        description="One line naming the move: from what, to what, by when. No filler."
+        description="Concise career-plan title derived from collected roles and explicit focus."
     )
     positioning_summary: str = Field(
         description=(
@@ -426,9 +426,11 @@ class ActionAnnotation(BaseModel):
 class FinalOutputDraft(BaseModel):
     """What the synthesis model actually returns. Narrower than `FinalOutput`.
 
-    Two fields of the final artifact are missing on purpose, because neither is the
+    Three fields of the final artifact are missing on purpose, because none is the
     model's to decide:
 
+    * **`headline`** — derived from collected roles and explicit focus at assembly,
+      so specializing in the same role is never described as changing professions.
     * **`action_items`** — assembled from the confirmed Action Plan plus these
       annotations, so step text and priority order are deterministic.
     * **`unknowns`** — derived from `XBuddyData` by `synthesis.derive_unknowns`. A
@@ -439,9 +441,6 @@ class FinalOutputDraft(BaseModel):
     documented on the extract models.
     """
 
-    headline: str = Field(
-        description="One line naming the move: from what, to what, by when. No filler."
-    )
     positioning_summary: str = Field(
         description=(
             "Two or three sentences on how this person should present themselves, "
@@ -493,6 +492,13 @@ class FinalOutputDraft(BaseModel):
         return annotations
 
 
+class PendingActionPlan(BaseModel):
+    """Validated but unagreed steps, bound to the exact assistant proposal."""
+
+    message_id: str
+    action_items: list[str] = Field(min_length=3)
+
+
 class XBuddyState(MessagesState):
     """State for the JobBuddy agent.
 
@@ -533,6 +539,10 @@ class XBuddyState(MessagesState):
     agent_output: NotRequired[ChatAgentOutput | None]
     awaiting_user_input: NotRequired[bool]
     awaiting_satisfaction_feedback: NotRequired[bool]
+    # Confirmation inputs are processed before replying, once per HumanMessage id.
+    confirmation_processed_id: NotRequired[str | None]
+    reply_intent: NotRequired[Literal["CONVERSE", "PROPOSE_FIRST_DRAFT"]]
+    pending_action_plan: NotRequired[PendingActionPlan | None]
 
     # Error tracking
     error_count: NotRequired[int]

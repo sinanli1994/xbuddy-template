@@ -68,9 +68,10 @@ export function getActiveThreadId(): string | null {
   }
 }
 
-export function setActiveThreadId(threadId: string): void {
+export function setActiveThreadId(threadId: string | null): void {
   try {
-    window.localStorage.setItem(ACTIVE_KEY, threadId);
+    if (threadId === null) window.localStorage.removeItem(ACTIVE_KEY);
+    else window.localStorage.setItem(ACTIVE_KEY, threadId);
   } catch {
     /* ignore */
   }
@@ -103,6 +104,51 @@ const STOP_WORDS = new Set([
   'thinking', 'interested', 'popular', 'good', 'best', 'new',
 ]);
 
+/**
+ * Phrases that begin a qualifying clause. Everything from here on narrows a topic
+ * that has already been named, so the title is cut at the earliest one.
+ *
+ * This is what "Targeting AI Engineer Role Focused" was: the token window happened
+ * to end on `focused`, the participle that *opens* "focused on LLM applications",
+ * leaving a modifier with nothing to modify. Cutting the sentence before selecting
+ * words removes the cause rather than trimming the symptom.
+ *
+ * Deliberately a short literal list, not grammar. Every entry is a fixed phrase
+ * that reliably introduces detail, and anything unrecognised falls through to the
+ * previous behaviour.
+ */
+const QUALIFIER_BOUNDARIES = [
+  'focused on', 'focusing on', 'focussed on', 'centered on', 'centred on',
+  'with a focus on', 'with experience in', 'with a background in', 'with experience',
+  'specializing in', 'specialising in', 'related to', 'such as',
+  'because', 'within', 'so that', 'in order to',
+];
+
+/**
+ * Participles and qualifiers that must not be the final word of a title.
+ *
+ * The backstop for a window ending on a phrasing QUALIFIER_BOUNDARIES does not
+ * list. `Targeting` and the rest are fine leading a title -- "Targeting AI
+ * Engineer Role" reads correctly -- and wrong trailing one.
+ */
+const DANGLING_TAIL = new Set([
+  'focused', 'focusing', 'centered', 'centred', 'related', 'targeting', 'targeted',
+  'seeking', 'using', 'based', 'specializing', 'specialising', 'involving',
+  'transitioning', 'switching', 'aiming', 'considering', 'starting', 'working',
+]);
+
+/** Cut at the earliest qualifying clause, provided something is left in front. */
+function trimQualifiers(body: string): string {
+  let cut = body.length;
+  for (const phrase of QUALIFIER_BOUNDARIES) {
+    const index = body.indexOf(phrase + ' ');
+    // `> 0` rather than `>= 0`: a message opening with the phrase has no topic in
+    // front of it, so cutting there would leave nothing to title.
+    if (index > 0 && index < cut) cut = index;
+  }
+  return cut === body.length ? body : body.slice(0, cut).trim();
+}
+
 /** Words that read better in their conventional casing. */
 const CASING: Record<string, string> = {
   ai: 'AI', ml: 'ML', ux: 'UX', ui: 'UI', qa: 'QA', hr: 'HR',
@@ -131,13 +177,24 @@ export function titleFromFirstMessage(text: string): string {
   const cleaned = text.replace(/\s+/g, ' ').trim();
   if (!cleaned) return FALLBACK_TITLE;
 
-  let body = cleaned.toLowerCase();
+  // Canonicalize typographic apostrophes before matching known openers. After
+  // that pass, expand first-person apostrophe forms so the punctuation scrubber
+  // cannot turn "I'm targeting..." into the stray title token "m".
+  let body = cleaned.toLowerCase().replace(/\u2019/g, "'");
   for (const prefix of FILLER_PREFIXES) {
     if (body.startsWith(`${prefix} `)) {
       body = body.slice(prefix.length + 1);
       break;
     }
   }
+  body = body
+    .replace(/\bi'm\b/g, 'i am')
+    .replace(/\bi'd\b/g, 'i would')
+    .replace(/\bi've\b/g, 'i have');
+
+  // Before any token selection: the detail after a qualifying clause is what makes
+  // the window land mid-phrase.
+  body = trimQualifiers(body);
 
   const words = body
     .replace(/[^\p{L}\p{N}\s+#.-]/gu, ' ')
@@ -161,8 +218,15 @@ export function titleFromFirstMessage(text: string): string {
   }
 
   const chosen = meaningful.slice(0, 5);
-  let title = chosen.map(titleCase).join(' ');
-  return bound(title);
+  // Never end on a dangling participle. Trimming can reduce the window to a single
+  // word, which is the one-word case again and gets the same neutral qualifier.
+  while (chosen.length > 1 && DANGLING_TAIL.has(chosen[chosen.length - 1])) {
+    chosen.pop();
+  }
+  if (chosen.length === 1) {
+    return bound(titleCase(chosen[0]) + ' Career Conversation');
+  }
+  return bound(chosen.map(titleCase).join(' '));
 }
 
 /** Clip to TITLE_MAX on a word boundary where one is close enough. */
@@ -196,9 +260,19 @@ export function rememberConversation(threadId: string, userId: number, title?: s
     });
   } else {
     const record = list[index];
+    const repairsLegacyApostropheTitle = Boolean(
+      title && record.label === `M ${title}`,
+    );
     list[index] = {
       ...record,
-      label: record.label === FALLBACK_TITLE && title ? title : record.label,
+      // Older builds tokenized "I'm ..." as "i" + "m" and persisted titles
+      // such as "M Targeting AI Engineer Role". Restore already supplies the
+      // deterministic title from the real first message, so repair only that
+      // exact legacy shape; ordinary later messages still cannot rename a row.
+      label:
+        (record.label === FALLBACK_TITLE || repairsLegacyApostropheTitle) && title
+          ? title
+          : record.label,
       updatedAt: now,
     };
   }
@@ -217,6 +291,7 @@ export function rememberConversation(threadId: string, userId: number, title?: s
 export function deleteConversation(threadId: string): DemoConversation[] {
   const remaining = readList().filter((c) => c.threadId !== threadId);
   writeList(remaining);
+  if (getActiveThreadId() === threadId) setActiveThreadId(null);
   return remaining.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
@@ -244,9 +319,9 @@ export function mintIdentity(): DemoIdentity {
  * conversation, never the one on screen.
  *
  * Falls back to the most recent record only when the active id names nothing that
- * still exists, and mints a fresh thread when the list is empty.
+ * still exists. An empty list stays empty; only the New Conversation action creates.
  */
-export function resolveActiveIdentity(): DemoIdentity {
+export function resolveActiveIdentity(): DemoIdentity | null {
   const list = listConversations();
   const activeId = getActiveThreadId();
 
@@ -259,8 +334,6 @@ export function resolveActiveIdentity(): DemoIdentity {
     return { threadId: newest.threadId, userId: newest.userId };
   }
 
-  const fresh = mintIdentity();
-  rememberConversation(fresh.threadId, fresh.userId);
-  setActiveThreadId(fresh.threadId);
-  return fresh;
+  setActiveThreadId(null);
+  return null;
 }

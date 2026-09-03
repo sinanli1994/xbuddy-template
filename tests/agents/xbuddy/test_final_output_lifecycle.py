@@ -351,18 +351,17 @@ async def test_a_correction_confirmed_in_the_same_turn_keeps_the_section_done(
 
 
 class CountingSynthesis:
-    """Fake synthesis whose headline can change between runs."""
+    """Fake synthesis whose body can change between runs; title comes from state."""
 
-    def __init__(self, headline="QA Analyst to Senior SRE"):
-        self.headline = headline
+    def __init__(self, summary="Four years of QA moving into automation."):
+        self.summary = summary
         self.calls = 0
 
     async def ainvoke(self, messages, *args, **kwargs):
         self.calls += 1
         return {
             "parsed": FinalOutputDraft(
-                headline=self.headline,
-                positioning_summary="Four years of QA moving into automation.",
+                positioning_summary=self.summary,
                 strengths_to_leverage=["systems debugging"],
                 skill_priorities=["Kubernetes"],
                 search_targets=["fintech"],
@@ -403,12 +402,12 @@ async def test_a_reconfirmed_section_regenerates_exactly_once(monkeypatch, make_
 
 @pytest.mark.asyncio
 async def test_the_regenerated_artifact_reflects_the_new_synthesis(monkeypatch, make_state):
-    chain = CountingSynthesis(headline="QA Analyst to Platform Engineer")
+    chain = CountingSynthesis(summary="Updated positioning for platform engineering.")
     monkeypatch.setattr(synthesis_module, "_synthesis_chain", lambda: chain)
 
     update = await implementation_node(
         make_state(
-            user_data=complete_data(),
+            user_data=complete_data(target_roles=["Platform Engineer"]),
             section_states=all_done(),
             final_output=None,
             should_generate_final_output=True,
@@ -416,7 +415,8 @@ async def test_the_regenerated_artifact_reflects_the_new_synthesis(monkeypatch, 
         {},
     )
 
-    assert update["final_output"].startswith("# QA Analyst to Platform Engineer")
+    assert update["final_output"].startswith("# Transition from QA Analyst to Platform Engineer")
+    assert "Updated positioning for platform engineering." in update["final_output"]
     assert update["final_output"] != EXISTING_ARTIFACT
 
 

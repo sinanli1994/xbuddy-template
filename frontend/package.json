@@ -9,7 +9,13 @@
     "lint": "next lint",
     "check:contract": "node scripts/check-demo-contract.mjs",
     "check:titles": "npx tsx scripts/title-probe.ts",
-    "check:streaming": "node scripts/streaming-probe.mjs"
+    "check:conversations": "npx tsx scripts/conversation-probe.ts",
+    "check:scroll": "npx tsx scripts/chat-scroll-probe.ts",
+    "check:layout": "npx tsx scripts/sidebar-layout-probe.tsx",
+    "check:reveal": "npx tsx scripts/text-reveal-probe.ts",
+    "check:streaming": "node scripts/streaming-probe.mjs",
+    "check:sse-split": "node scripts/sse-split-probe.mjs",
+    "check:parity": "npx tsx scripts/stream-parity-probe.ts"
   },
   "dependencies": {
     "next": "15.5.24",

@@ -1,5 +1,6 @@
 'use client';
 
+import React from 'react';
 import type { CompletionState, PublicSection } from '@/components/ChatArea';
 import type { DemoConversation } from '@/utils/demoConversations';
 
@@ -17,8 +18,8 @@ const ROADMAP = ['Career Goal', 'Background', 'Job Preferences', 'Skill Assessme
 /**
  * The JobBuddy sidebar.
  *
- * Order follows the reference UI's information architecture — product, progress, new
- * conversation, recent conversations, status, developer details — with JobBuddy
+ * Order keeps collection, artifact status and its action inside progress — then new
+ * conversation, recent conversations, developer details — with JobBuddy
  * content. The new-conversation control sits *between* progress and the list, where
  * it reads as "add another one of these", rather than under the title (where it looks
  * like a product action) or pinned to the bottom (where it drifts with content
@@ -99,7 +100,7 @@ export default function JobBuddyProgress({
       </div>
 
       {/* 2. Progress */}
-      <div style={{ flexShrink: 0 }}>
+      <div data-testid="workflow-progress" style={{ flexShrink: 0 }}>
         <SectionHeading>Your Progress</SectionHeading>
         {sections.length === 0 ? (
           <>
@@ -181,6 +182,77 @@ export default function JobBuddyProgress({
             })}
           </ul>
         )}
+        {/* Completion belongs to the same authoritative progress block. */}
+        <div data-testid="completion-summary" style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6, marginTop: 12, padding: '10px 8px 0', borderTop: '1px solid #e2e8f0' }}>
+          <StatusLine
+            label="Collection"
+            value={completion?.collection_complete ? 'Complete' : 'In Progress'}
+            done={Boolean(completion?.collection_complete)}
+          />
+          <StatusLine
+            label="Final Plan"
+            value={completion?.artifact_available ? 'Ready' : 'Not Ready'}
+            done={Boolean(completion?.artifact_available)}
+          />
+          {completion?.artifact_available && finalPlanReady && (
+            <button
+              onClick={onViewFinalPlan}
+              style={{
+                padding: '9px 12px',
+                borderRadius: 8,
+                backgroundColor: '#ecfdf5',
+                border: '1px solid #a7f3d0',
+                fontSize: 13,
+                fontWeight: 600,
+                color: '#065f46',
+                cursor: 'pointer',
+                textAlign: 'left',
+              }}
+            >
+              View Final Plan
+            </button>
+          )}
+
+          {completion?.artifact_available && !finalPlanReady && (
+            // The plan exists but could not be fetched. Saying so beats a button that
+            // opens nothing, and beats pretending the plan is not ready.
+            <div
+              style={{
+                padding: '8px 10px',
+                borderRadius: 8,
+                backgroundColor: finalPlanError ? '#fef2f2' : '#f8fafc',
+                border: `1px solid ${finalPlanError ? '#fecaca' : '#e2e8f0'}`,
+                fontSize: 12,
+                color: finalPlanError ? '#991b1b' : '#64748b',
+              }}
+            >
+              {finalPlanError ? (
+                <>
+                  <div style={{ marginBottom: 6 }}>
+                    Your final plan is ready, but could not be loaded.
+                  </div>
+                  <button
+                    onClick={onRetryFinalPlan}
+                    style={{
+                      padding: '4px 9px',
+                      fontSize: 12,
+                      fontWeight: 600,
+                      color: '#991b1b',
+                      backgroundColor: '#ffffff',
+                      border: '1px solid #fecaca',
+                      borderRadius: 6,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    Retry
+                  </button>
+                </>
+              ) : (
+                'Loading your final plan…'
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* 3. New conversation — between progress and the list, per the reference UI. */}
@@ -203,8 +275,7 @@ export default function JobBuddyProgress({
         + Start a new conversation
       </button>
 
-      {/* 4. Recent conversations — the only part allowed to scroll, and only when it
-             outgrows the space left over. The page itself never scrolls. */}
+      {/* 4. Bounded recent list scrolls internally; the sidebar also scrolls on short viewports. */}
       <div style={{ display: 'flex', flexDirection: 'column' }}>
         <SectionHeading>Recent Conversations</SectionHeading>
         {conversations.length === 0 ? (
@@ -298,79 +369,7 @@ export default function JobBuddyProgress({
         )}
       </div>
 
-      {/* 5. Status */}
-      <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <StatusLine
-          label="Collection"
-          value={completion?.collection_complete ? 'Complete' : 'In Progress'}
-          done={Boolean(completion?.collection_complete)}
-        />
-        <StatusLine
-          label="Final Plan"
-          value={completion?.artifact_available ? 'Ready' : 'Not Ready'}
-          done={Boolean(completion?.artifact_available)}
-        />
-        {completion?.artifact_available && finalPlanReady && (
-          <button
-            onClick={onViewFinalPlan}
-            style={{
-              padding: '9px 12px',
-              borderRadius: 8,
-              backgroundColor: '#ecfdf5',
-              border: '1px solid #a7f3d0',
-              fontSize: 13,
-              fontWeight: 600,
-              color: '#065f46',
-              cursor: 'pointer',
-              textAlign: 'left',
-            }}
-          >
-            View Final Plan
-          </button>
-        )}
-
-        {completion?.artifact_available && !finalPlanReady && (
-          // The plan exists but could not be fetched. Saying so beats a button that
-          // opens nothing, and beats pretending the plan is not ready.
-          <div
-            style={{
-              padding: '8px 10px',
-              borderRadius: 8,
-              backgroundColor: finalPlanError ? '#fef2f2' : '#f8fafc',
-              border: `1px solid ${finalPlanError ? '#fecaca' : '#e2e8f0'}`,
-              fontSize: 12,
-              color: finalPlanError ? '#991b1b' : '#64748b',
-            }}
-          >
-            {finalPlanError ? (
-              <>
-                <div style={{ marginBottom: 6 }}>
-                  Your final plan is ready, but could not be loaded.
-                </div>
-                <button
-                  onClick={onRetryFinalPlan}
-                  style={{
-                    padding: '4px 9px',
-                    fontSize: 12,
-                    fontWeight: 600,
-                    color: '#991b1b',
-                    backgroundColor: '#ffffff',
-                    border: '1px solid #fecaca',
-                    borderRadius: 6,
-                    cursor: 'pointer',
-                  }}
-                >
-                  Retry
-                </button>
-              </>
-            ) : (
-              'Loading your final plan…'
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* 6. Developer details */}
+      {/* 5. Developer details — always last. */}
       <details style={{ flexShrink: 0, fontSize: 12, color: '#64748b' }}>
         <summary style={{ cursor: 'pointer', userSelect: 'none' }}>Developer Details</summary>
         <dl

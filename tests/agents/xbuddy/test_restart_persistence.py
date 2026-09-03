@@ -21,6 +21,7 @@ with the Supabase settings blanked.
 
 import uuid
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 from langchain_community.chat_models import FakeListChatModel
@@ -30,7 +31,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agents.xbuddy.enums import DecisionAction, SectionID, SectionStatus
 from agents.xbuddy.graph.builder import build_xbuddy_graph
-from agents.xbuddy.models import SectionDecision, SectionState
+from agents.xbuddy.models import SectionDecision, SectionState, XBuddyData
 
 # Values the fake extraction returns per section, so the restored state can be
 # asserted against concrete data rather than "something non-empty".
@@ -217,11 +218,17 @@ async def test_restored_state_is_usable_for_a_second_turn(tmp_path, fake_models)
 
 
 @pytest.mark.asyncio
-async def test_should_generate_final_output_survives_restart(tmp_path, fake_models):
+async def test_should_generate_final_output_survives_restart(tmp_path, fake_models, monkeypatch):
     """Seed four sections done, complete the fifth, then restart."""
     db = tmp_path / "xbuddy-checkpoint.db"
     thread_id = f"restart-complete-{uuid.uuid4().hex[:8]}"
     config = config_for(thread_id)
+    # A confirmation must refer to an existing plan. An empty Action Plan now
+    # correctly requests a proposal instead of treating "yes" as collected data.
+    monkeypatch.setattr(
+        "agents.xbuddy.nodes.implementation.synthesize_final_output",
+        AsyncMock(return_value=(None, "synthesis deferred for restart test")),
+    )
 
     four_done = {
         section.value: SectionState(
@@ -242,6 +249,12 @@ async def test_should_generate_final_output_survives_restart(tmp_path, fake_mode
                 "section_states": four_done,
                 "current_section": SectionID.ACTION_PLAN,
                 "router_directive": "stay",
+                "awaiting_satisfaction_feedback": True,
+                "user_data": XBuddyData(action_items=[
+                    "Tailor the CV for target roles",
+                    "Build a relevant portfolio project",
+                    "Contact practitioners in the target field",
+                ]),
             },
             config,
         )

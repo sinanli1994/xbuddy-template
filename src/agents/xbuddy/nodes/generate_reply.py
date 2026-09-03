@@ -8,17 +8,22 @@ LangGraph surfaces them under `stream_mode="messages"`, which the service turns
 into SSE `token` events. Assembling chunks here would duplicate that stream for
 no benefit.
 
-This is the only node whose LLM call is deliberately *untagged* — its tokens are
-meant to reach the user. generate_decision tags its call so the service drops it.
+Ordinary replies are deliberately untagged and stream live. Structured first-draft
+proposals are private until validation, then emit one complete message. Decision,
+extraction, and raw proposal JSON must never appear in the user's token stream.
 """
 
 import logging
+import time
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from ..models import ContextPacket, XBuddyState
+from ..action_plan import propose_first_draft
+from ..enums import SectionID
+from ..models import ContextPacket, PendingActionPlan, XBuddyData, XBuddyState
 from ..sections.base_prompt import SATISFACTION_OVERLAY
 
 logger = logging.getLogger(__name__)
@@ -63,7 +68,8 @@ def _build_messages(
     """
     system_prompt = packet.system_prompt
 
-    if state.get("awaiting_satisfaction_feedback", False):
+    awaiting_satisfaction = bool(state.get("awaiting_satisfaction_feedback", False))
+    if awaiting_satisfaction:
         system_prompt = f"{system_prompt}\n\n{SATISFACTION_OVERLAY.strip()}"
 
     history: list[BaseMessage] = list(state.get("messages", []))
@@ -73,6 +79,11 @@ def _build_messages(
 
 async def generate_reply_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState:
     """Generate the conversational reply for the current section."""
+    logger.info(
+        "[REPLY] start monotonic_ms=%.0f thread=%s section=%s intent=%s",
+        time.monotonic() * 1000, state.get("thread_id"),
+        state.get("current_section"), state.get("reply_intent", "CONVERSE"),
+    )
     packet = state.get("context_packet")
     if packet is None:
         logger.error("generate_reply: no context_packet; returning fallback without calling model")
@@ -84,6 +95,33 @@ async def generate_reply_node(state: XBuddyState, config: RunnableConfig) -> XBu
         return fallback  # type: ignore[return-value]
 
     messages, window = _build_messages(state, packet)
+
+    if state.get("reply_intent") == "PROPOSE_FIRST_DRAFT":
+        data = state.get("user_data") or XBuddyData()
+        try:
+            if packet.section_id is not SectionID.ACTION_PLAN or data.action_items:
+                raise ValueError("proposal intent requires Action Plan with no agreed items")
+            content, steps = await propose_first_draft(packet, data, config)
+            message_id = str(uuid4())
+            reply = AIMessage(content=content, id=message_id)
+            proposal_update: dict[str, Any] = {
+                "messages": [reply], "short_memory": window,
+                "pending_action_plan": PendingActionPlan(message_id=message_id, action_items=steps),
+                "awaiting_user_input": True,
+                "awaiting_satisfaction_feedback": True,
+            }
+        except Exception as exc:
+            logger.exception("generate_reply: structured proposal failed validation")
+            proposal_update = {
+                "messages": [AIMessage(content=(
+                    "I couldn't prepare a valid action-plan draft this time. "
+                    "Please retry and I'll use the information you've already shared."
+                ))],
+                "awaiting_user_input": True,
+                "last_error": f"action plan proposal error: {exc}",
+                "error_count": state.get("error_count", 0) + 1,
+            }
+        return proposal_update  # type: ignore[return-value]
 
     try:
         response = await _reply_model().ainvoke(messages, config)

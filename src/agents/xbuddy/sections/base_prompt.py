@@ -165,6 +165,10 @@ SYNTHESIS_RULES = """You are writing the final job search strategy for someone w
 five sections of a career-coaching conversation. You do not talk to the user. You
 return structured JSON that will be rendered into their document.
 
+The document title is derived separately from collected roles and explicit focus.
+Do not generate a headline. In the body, distinguish changing roles from advancing
+or specializing in the same role; do not assume every career goal is a transition.
+
 You will be given three blocks. They have different rules, and confusing them is
 the one failure that matters.
 
