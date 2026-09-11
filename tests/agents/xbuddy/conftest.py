@@ -361,3 +361,28 @@ def decision_chain(monkeypatch):
     fake = RecordingChain(decision=_make_decision())
     monkeypatch.setattr(module, "_decision_chain", lambda: fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def no_real_resume_store(monkeypatch):
+    """Autouse guard: no test may reach the live Supabase project through Resume RAG.
+
+    The same hazard `persistence` exists for — `.env` credentials are visible to
+    tests — applied to the resume store, whose `replace` writes real rows. Every
+    unit test injects a fake client; this catches the one that forgets.
+
+    Yields the list of blocked attempts, asserted empty at teardown, because the
+    interactive retrieval path swallows exceptions by design and would otherwise
+    hide a forgotten injection behind an empty result.
+    """
+    from agents.xbuddy.resume import store as store_module
+
+    attempts: list[str] = []
+
+    def blocked():
+        attempts.append("resume store client")
+        raise AssertionError("Unmocked Supabase client in Resume RAG: inject a fake client")
+
+    monkeypatch.setattr(store_module, "_default_client", blocked)
+    yield attempts
+    assert not attempts, "A test reached for the real Supabase client through the resume store"

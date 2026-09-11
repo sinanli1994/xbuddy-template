@@ -12,7 +12,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import AzureChatOpenAI, ChatOpenAI, OpenAIEmbeddings
 
 from core.models import (
     AllModelEnum,
@@ -193,3 +193,32 @@ def get_model(model_name: AllModelEnum | None = None, /) -> ModelT:
         return FakeToolModel(responses=["This is a test response from the fake model."])
 
     raise ValueError(f"Unsupported model: {model_name}")
+
+
+# =============================================================================
+# Embeddings — Resume RAG
+# =============================================================================
+
+# `text-embedding-3-small` at its native 1536 dimensions. Changing either changes
+# every stored vector and every cache key built from them (see
+# agents/xbuddy/resume/embeddings.py), so both are named once, here.
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIMENSIONS = 1536
+
+
+@cache
+def get_embeddings() -> OpenAIEmbeddings:
+    """The embedding model, shared like `get_model()`.
+
+    Callers import this inside the function that uses it (`from core.llm import
+    get_embeddings`), the same way the nodes import `get_model`, so the test suite's
+    autouse guard can replace it and no test can reach the API by accident.
+
+    The key is passed from settings when it is set. `OpenAIEmbeddings` reads the
+    environment on its own otherwise, and refuses to construct without a key — which
+    is the right failure for a caller that forgot to configure one.
+    """
+    kwargs: dict = {"model": EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSIONS}
+    if settings.OPENAI_API_KEY is not None:
+        kwargs["api_key"] = settings.OPENAI_API_KEY
+    return OpenAIEmbeddings(**kwargs)

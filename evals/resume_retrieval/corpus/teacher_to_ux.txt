@@ -1,0 +1,45 @@
+MORGAN LEE
+Vancouver, BC | morgan.lee@example.com | morganlee.design
+
+Professional Summary
+Former high-school math and computer science teacher, now a UX designer. Nine years of designing learning experiences for teenagers taught me to watch people struggle with something, ask why, and redesign it. I have completed three freelance UX projects and am looking for a full-time product design role.
+
+Relevant Experience
+Freelance UX Designer
+Vancouver, BC | Sep 2023 – Present
+• Redesigned the booking flow for a regional climbing gym; online bookings rose 22% in the first two months.
+• Ran moderated usability tests with 12 participants and synthesised the findings into a prioritised issue list.
+• Built interactive prototypes in Figma and handed off annotated specs to a two-person development team.
+
+Mathematics and Computer Science Teacher, Riverside Secondary School
+Vancouver, BC | Sep 2014 – Jun 2023
+• Taught grades 9–12 mathematics and introductory programming to classes of up to 32 students.
+• Redesigned the grade 10 programming course after interviewing 30 students and parents about where they got stuck; course failure rate dropped from 18% to 7%.
+• Led a team of four teachers that rebuilt the math department's online course portal, running card-sorting sessions with students to organise the content.
+• Created accessible materials for students with visual impairments, including high-contrast worksheets and screen-reader-friendly quizzes.
+• Coordinated the school's first coding club, growing it from 6 to 45 members over three years.
+• Mentored eleven student teachers during their practicum placements, observing their lessons and giving written feedback every week.
+• Analysed assessment results each term to identify which topics needed to be retaught, and adjusted lesson plans accordingly.
+• Organised parent information evenings attended by more than 200 families, presenting curriculum changes in plain language.
+• Wrote the department's guide to giving feedback on student work, which the whole school later adopted.
+• Served on the school technology committee that selected a new learning management system, piloting three options with students and staff before recommending one.
+• Ran end-of-term surveys with every class and used the results to change how homework was assigned and explained.
+• Built a spreadsheet dashboard that let teachers track each student's progress across units at a glance, used by the whole department.
+• Rewrote the introductory programming unit around short, visual exercises after noticing that students who fell behind in week two rarely caught up.
+• Worked with the school counsellor to adapt course materials for students returning after long absences.
+
+Portfolio
+Accessible Field-Trip Booking App (case study)
+A self-initiated project to make school field-trip sign-ups usable for parents with low vision. I interviewed five parents, mapped their journey, and designed a high-contrast mobile flow that passed WCAG 2.1 AA checks. The case study documents the research, three rounds of iteration, and the final prototype.
+
+Education
+Bachelor of Education, University of British Columbia, 2014
+Bachelor of Science in Mathematics, University of British Columbia, 2013
+
+Certifications & Training
+Google UX Design Professional Certificate (2023)
+Interaction Design Foundation: Accessibility for Designers (2023)
+
+Volunteering
+Volunteer mentor, Girls Who Code Vancouver chapter (2021 – Present)
+• Mentor high-school students building their first web projects every Saturday.
