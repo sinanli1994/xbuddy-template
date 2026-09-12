@@ -52,6 +52,15 @@ SECTION_LABELS: dict[ResumeSection, str] = {
 }
 
 
+# Sections retrieval never returns, enforced in the match RPC and re-checked in the
+# adapter. Summary is excluded because the Stage 2 eval measured it as the one
+# chunking-level change worth making; Header because it is contact details — name,
+# email, phone, links — which rank on a tagline and are never evidence of a skill.
+# Explicit skill lists written inside a Summary are promoted to Skills at chunk
+# time (chunking.promote_summary_skills), so excluding Summary does not bury them.
+NON_RETRIEVABLE_SECTIONS = frozenset({ResumeSection.SUMMARY, ResumeSection.HEADER})
+
+
 ChunkStrategy = Literal["section", "window"]
 
 

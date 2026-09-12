@@ -499,6 +499,38 @@ class PendingActionPlan(BaseModel):
     action_items: list[str] = Field(min_length=3)
 
 
+class ResumeEvidence(BaseModel):
+    """One retrieved resume passage, as the conversation may use it."""
+
+    chunk_index: int
+    section: str
+    content: str
+    similarity: float
+
+
+class ResumeContext(BaseModel):
+    """What this conversation knows about its uploaded resume.
+
+    Never confirmed user data. `candidate_facts` are the resume's claims, which
+    JobBuddy may propose and the user confirms or corrects; `evidence` is what
+    retrieval returned. Neither is ever copied into `user_data` — the existing
+    extraction of the user's own replies is the only path there.
+
+    Cached in state so the router, which runs twice per turn, looks the resume up
+    once per user message and retrieves once per (document, section, query).
+    """
+
+    # None means "looked, and there is no resume on file".
+    document_id: str | None = None
+    filename: str | None = None
+    candidate_facts: dict[str, Any] | None = None
+    # The user message this lookup served; a new message means a fresh lookup.
+    checked_for: str | None = None
+    # "<document_id>:<section>:<query hash>" — evidence is valid only for this key.
+    evidence_key: str | None = None
+    evidence: list[ResumeEvidence] = Field(default_factory=list)
+
+
 class XBuddyState(MessagesState):
     """State for the JobBuddy agent.
 
@@ -543,6 +575,9 @@ class XBuddyState(MessagesState):
     confirmation_processed_id: NotRequired[str | None]
     reply_intent: NotRequired[Literal["CONVERSE", "PROPOSE_FIRST_DRAFT"]]
     pending_action_plan: NotRequired[PendingActionPlan | None]
+    # Resume RAG: the uploaded resume's candidate facts and retrieved evidence.
+    # Absent for conversations without a resume. Never merged into user_data.
+    resume_context: NotRequired[ResumeContext | None]
 
     # Error tracking
     error_count: NotRequired[int]

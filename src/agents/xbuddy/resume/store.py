@@ -26,7 +26,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ResumeSection
+from .models import NON_RETRIEVABLE_SECTIONS, ResumeSection
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +269,10 @@ class ResumeStore:
     async def match(
         self, *, user_id: int, thread_id: str, query_embedding: Sequence[float], k: int
     ) -> list[RetrievedChunk]:
-        """Top-k chunks by exact cosine similarity, Summary excluded. Raises on failure."""
+        """Top-k chunks by exact cosine similarity, Summary and Header excluded.
+
+        Raises on failure.
+        """
         payload = build_match_payload(
             user_id=user_id,
             thread_id=thread_id,
@@ -282,11 +285,15 @@ class ResumeStore:
             chunks = [RetrievedChunk.model_validate(row) for row in rows]
         except Exception as exc:
             raise ResumeStoreError("match_resume_chunks returned an unexpected shape") from exc
-        if any(c.section is ResumeSection.SUMMARY for c in chunks):
-            # The function excludes Summary. If one arrives anyway, the deployed
+        blocked = sorted({c.section.value for c in chunks if c.section in NON_RETRIEVABLE_SECTIONS})
+        if blocked:
+            # The function excludes these. If one arrives anyway, the deployed
             # function is not the migrated one — say so rather than use it.
-            logger.error("resume match: Summary chunk returned; is migration 003 applied?")
-            chunks = [c for c in chunks if c.section is not ResumeSection.SUMMARY]
+            logger.error(
+                "resume match: %s chunk returned; are migrations 003 and 004 applied?",
+                ", ".join(blocked),
+            )
+            chunks = [c for c in chunks if c.section not in NON_RETRIEVABLE_SECTIONS]
         return chunks[:k]
 
     # -- plumbing -----------------------------------------------------------

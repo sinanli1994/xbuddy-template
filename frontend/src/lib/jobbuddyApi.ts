@@ -30,12 +30,16 @@ export function jobbuddyApiUrl(): string {
  * has. A deployed backend always has one, and refuses to start without it.
  */
 export function jobbuddyHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  return { "Content-Type": "application/json", ...jobbuddyAuthHeaders() };
+}
+
+/**
+ * The bearer token alone, for a multipart upload. `fetch` must set that request's
+ * Content-Type itself, because only it knows the multipart boundary.
+ */
+export function jobbuddyAuthHeaders(): Record<string, string> {
   const token = process.env.JOBBUDDY_API_TOKEN;
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-  return headers;
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 /** The only agent this demo serves. */

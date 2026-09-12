@@ -59,7 +59,7 @@ def parameter_names(name: str) -> list[str]:
 
 def test_the_migration_follows_the_numbering():
     names = sorted(p.name for p in MIGRATION.parent.glob("*.sql"))
-    assert names[-1] == "003_resume_rag.sql"
+    assert names.index("003_resume_rag.sql") == names.index("002_final_outputs.sql") + 1
 
 
 def test_pgvector_is_enabled_in_the_extensions_schema():
@@ -241,6 +241,8 @@ def test_match_filters_by_both_user_and_thread():
 
 
 def test_match_excludes_summary_and_nothing_else():
+    """003 as shipped. Migration 004 replaces this function to exclude Header too;
+    that file's own contract is checked in test_resume_retrieval_exclusions.py."""
     body = function_body("match_resume_chunks")
     assert f"AND c.section <> '{ResumeSection.SUMMARY.value}'" in body
     assert len(re.findall(r"c\.section\b", body.split("FROM", 1)[1])) == 1  # one section predicate

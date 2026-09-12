@@ -48,6 +48,8 @@ const SERVER_ROUTES = [
   'src/app/api/history/route.ts',
   'src/app/api/completion/route.ts',
   'src/app/api/final-output/route.ts',
+  'src/app/api/resume/route.ts',
+  'src/app/api/resume/status/route.ts',
 ];
 const SERVER_LIB = ['src/lib/jobbuddyApi.ts'];
 const CLIENT_FILES = [
@@ -57,6 +59,8 @@ const CLIENT_FILES = [
   'src/utils/demoConversations.ts',
   'src/components/JobBuddyWelcome.tsx',
   'src/components/FinalPlanPanel.tsx',
+  'src/components/ResumeCard.tsx',
+  'src/utils/resume.ts',
 ];
 const DEMO_PATH = [...SERVER_ROUTES, ...SERVER_LIB, ...CLIENT_FILES];
 
@@ -114,8 +118,9 @@ for (const route of SERVER_ROUTES) {
     `${route} owns the Authorization header`,
     // The call site, not the import. Matching `jobbuddyHeaders` anywhere in the file
     // stayed green when the outbound fetch was switched back to a bare
-    // Content-Type header while the import sat unused at the top.
-    text.includes('headers: jobbuddyHeaders(),'),
+    // Content-Type header while the import sat unused at the top. The multipart
+    // upload uses the token-only variant, so fetch can set the boundary itself.
+    text.includes('headers: jobbuddyHeaders(),') || text.includes('headers: jobbuddyAuthHeaders(),'),
     'the outbound request attaches it'
   );
 }
@@ -913,6 +918,8 @@ check(
       'src/app/api/completion/route.ts',
       'src/app/api/final-output/route.ts',
       'src/app/api/history/route.ts',
+      'src/app/api/resume/route.ts',
+      'src/app/api/resume/status/route.ts',
       'src/app/page.tsx',
     ]),
   routeFiles.join(', ')
@@ -1131,6 +1138,98 @@ check(
   'titles still need no model call',
   !re('fetch\\(|/api/').test(titleRules),
   'naming a conversation is deterministic and local by design'
+);
+
+// ------------------------------------------------------ Phase 8: resume RAG ----
+//
+// Source checks for wiring a probe cannot see. The proxies' runtime behaviour —
+// token attached, metadata only, errors filtered — is measured by
+// scripts/resume-proxy-probe.mjs; the thread-scoping rule by scripts/resume-probe.ts.
+
+const uploadRoute = code('src/app/api/resume/route.ts');
+const statusRoute = code('src/app/api/resume/status/route.ts');
+const page8 = code('src/app/page.tsx');
+const lib8 = code('src/lib/jobbuddyApi.ts');
+const resumeRules = code('src/utils/resume.ts');
+const resumeCard = code('src/components/ResumeCard.tsx');
+
+check(
+  'the upload proxy forwards to /resume with the token-only header',
+  uploadRoute.includes('/resume`') && uploadRoute.includes('headers: jobbuddyAuthHeaders(),') &&
+    !uploadRoute.includes('Content-Type'),
+  'a hand-set Content-Type would drop the multipart boundary'
+);
+check(
+  'the token-only helper lives in the server-only module',
+  re('export function jobbuddyAuthHeaders').test(lib8) &&
+    re('jobbuddyHeaders[^]{0,200}\\.\\.\\.jobbuddyAuthHeaders\\(\\)').test(lib8),
+  'one place builds the Authorization header'
+);
+check(
+  'the status proxy forwards to /resume/status',
+  statusRoute.includes('/resume/status`') && statusRoute.includes('headers: jobbuddyHeaders(),')
+);
+check(
+  'neither resume proxy passes the backend body through wholesale',
+  ![uploadRoute, statusRoute].some((t) => /NextResponse\.json\((await response\.json\(\)|data)\)/.test(t)) &&
+    ![uploadRoute, statusRoute].some((t) => t.includes('document_id') || t.includes('candidate')),
+  'metadata only: no document id, no candidate facts, no text'
+);
+check(
+  'backend error text is relayed only for known user-facing codes',
+  uploadRoute.includes('USER_FACING_CODES.has(detail.code)')
+);
+check(
+  'a 404 status reads as no resume; other failures stay failures',
+  re('status === 404[^]{0,120}has_resume: false').test(statusRoute) &&
+    re('!response\\.ok[^]{0,400}status_unavailable').test(statusRoute)
+);
+check(
+  'the resume status is restored with the conversation, outside its Promise.all',
+  re('const restore = useCallback[^]{0,500}void loadResumeStatus\\(id\\)').test(page8) &&
+    !re('Promise\\.all\\(\\[[^\\]]*resume').test(page8),
+  'a resume status failure must not fail the restore'
+);
+check(
+  'the resume view is scoped to the selected thread',
+  page8.includes('resume={resumeForThread(resume, identity?.threadId ?? null)}') &&
+    re('resume\\.threadId !== threadId').test(resumeRules) &&
+    re('prev\\?\\.threadId === threadId').test(page8),
+  'a view tagged with another thread is never shown or overwritten'
+);
+check(
+  'switching conversations clears the resume view',
+  re('const selectLocally[^]{0,900}setResume\\(null\\)').test(page8)
+);
+check(
+  'a new conversation makes no resume request',
+  !re('const handleNewConversation[^]{0,700}(fetch\\(|loadResumeStatus)').test(page8)
+);
+check(
+  'the resume file goes only to /api/resume',
+  re("fetch\\('/api/resume', \\{ method: 'POST', body: form \\}\\)").test(page8) &&
+    !re('handleUploadResume[^]{0,2400}/api/chat').test(page8)
+);
+check(
+  'late resume responses from a previous selection are dropped',
+  ['const loadResumeStatus', 'const handleUploadResume'].every((fn) => {
+    const start = page8.indexOf(fn);
+    const body = start < 0 ? '' : page8.slice(start, start + 2600);
+    // Both the success and the failure path of each request.
+    return (body.match(/if \(version !== selectionVersion\.current\) return;/g) ?? []).length >= 2;
+  })
+);
+check(
+  'the card claims indexed only from backend metadata',
+  resumeCard.includes("view.kind === 'indexed'") && !re("kind: 'indexed'").test(resumeCard)
+);
+check(
+  'resume rules stay pure — no fetch, no storage',
+  !re('fetch\\(|localStorage|sessionStorage').test(resumeRules)
+);
+check(
+  'no resume data is stored in the browser',
+  !re('localStorage[^\\n]*resume|resume[^\\n]*localStorage').test(page8)
 );
 
 // ----------------------------------------------------------------- report ----

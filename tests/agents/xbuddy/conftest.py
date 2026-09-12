@@ -386,3 +386,46 @@ def no_real_resume_store(monkeypatch):
     monkeypatch.setattr(store_module, "_default_client", blocked)
     yield attempts
     assert not attempts, "A test reached for the real Supabase client through the resume store"
+
+
+class ResumeBackend:
+    """Stands in for the resume store and retrieval as the router sees them.
+
+    Defaults to "no resume on file", so every graph test that does not ask for
+    resume behaviour runs exactly the pre-Resume-RAG path. Resume tests request
+    `resume_backend` by name and set `status` / `evidence` / failure flags.
+    """
+
+    def __init__(self) -> None:
+        self.status = None
+        self.evidence: list = []
+        self.fail_status = False
+        self.fail_retrieve = False
+        self.status_calls: list[tuple[int, str]] = []
+        self.retrieve_calls: list[tuple[int, str, str, int]] = []
+
+    async def fetch_status(self, user_id, thread_id):
+        self.status_calls.append((user_id, thread_id))
+        if self.fail_status:
+            raise RuntimeError("resume status unavailable (test)")
+        return self.status
+
+    async def retrieve(self, user_id, thread_id, query, k):
+        # The production helper never raises (it returns [] on any failure);
+        # `fail_retrieve` checks the router does not depend on that.
+        self.retrieve_calls.append((user_id, thread_id, query, k))
+        if self.fail_retrieve:
+            raise RuntimeError("resume retrieval unavailable (test)")
+        return list(self.evidence)
+
+
+@pytest.fixture(autouse=True)
+def resume_backend(monkeypatch):
+    """Autouse: the router's resume lookup and retrieval never leave the process."""
+    from agents.xbuddy.resume import context as resume_context
+
+    backend = ResumeBackend()
+    monkeypatch.setattr(resume_context, "_fetch_status", backend.fetch_status)
+    monkeypatch.setattr(resume_context, "_retrieve", backend.retrieve)
+    monkeypatch.setattr(resume_context, "resume_rag_configured", lambda: True)
+    return backend

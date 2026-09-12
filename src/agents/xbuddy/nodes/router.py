@@ -6,6 +6,12 @@ Fully deterministic: the navigation decision is already represented in
 structured state (`router_directive` + `section_states`), so no LLM is involved.
 Producing the directive from conversation is generate_decision's job (PR 3).
 
+The one piece of I/O here is Resume RAG context (resume/context.py): in
+Background and Skill Assessment only, a resume status read and, for Skill
+Assessment, one embedding plus a vector search. No model judges anything, the
+result is cached in state so the second router pass of a turn repeats none of
+it, and any failure degrades to "no resume context" rather than raising.
+
 The router has two entry points — once per invocation from `initialize`, and
 again on every loop back from `memory_updater` — so it must be safe to run
 repeatedly within a single invocation.
@@ -29,6 +35,7 @@ from ..context import build_context_packet
 from ..enums import RouterDirective, SectionID, SectionStatus
 from ..models import SectionState, XBuddyData, XBuddyState
 from ..prompts import get_next_unfinished_section
+from ..resume.context import render_resume_block, resolve_resume_context
 from ..state_factory import coerce_section_state
 
 logger = logging.getLogger(__name__)
@@ -146,13 +153,30 @@ async def router_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState
     if sections != existing_sections:
         update["section_states"] = sections
 
+    data = state.get("user_data") or XBuddyData()
+
+    # Resume RAG. Background and Skill Assessment may carry an unconfirmed resume
+    # block; every other section, and every conversation without a resume, gets
+    # none — so their prompt is unchanged. Never raises: a failed lookup or
+    # retrieval is logged and the turn proceeds without resume context.
+    resume = await resolve_resume_context(
+        user_id=state.get("user_id"),
+        thread_id=state.get("thread_id"),
+        section=section,
+        user_data=data,
+        messages=list(state.get("messages", [])),
+        cached=state.get("resume_context"),
+    )
+    if resume.changed:
+        update["resume_context"] = resume.context
+
     update["context_packet"] = build_context_packet(
         section_id=section,
         status=active.status,
         draft=active.content,
-        user_data=state.get("user_data") or XBuddyData(),
+        user_data=data,
+        resume_block=render_resume_block(section, resume.context, data),
     )
-    data = state.get("user_data") or XBuddyData()
     update["reply_intent"] = (
         "PROPOSE_FIRST_DRAFT"
         if section is SectionID.ACTION_PLAN and not data.action_items

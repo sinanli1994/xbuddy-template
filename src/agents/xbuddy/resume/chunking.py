@@ -133,6 +133,22 @@ _HEADINGS: dict[str, ResumeSection] = {
     ),
 }
 
+# An explicit skill list written inside a Summary: a short label, a colon, then
+# three or more short comma-separated items — "Tech Stack: Python, Go, SQL", or a
+# category of the writer's own ("Backend & Web: Python, FastAPI, Next.js").
+# Deliberately structural rather than a vocabulary of labels, because resumes name
+# their own categories, and deliberately narrow: prose must never be relabelled as
+# skills. A sentence fails on item length or on a mid-line full stop, so
+# "Specialties: building payment platforms that scale to millions of events" (one
+# long item) and "I led three teams, shipped four products, and hired six people."
+# (long items, trailing stop) are both left in the Summary.
+_SKILL_LABEL_MAX_WORDS = 5
+_SKILL_LABEL_MAX_CHARS = 40
+_SKILL_MIN_ITEMS = 3
+_SKILL_ITEM_MAX_WORDS = 5
+# A full stop that ends a sentence, not the one inside "Fly.io" or "Next.js".
+_SENTENCE_STOP = re.compile(r"\.(?:\s|$)")
+
 _BULLET = re.compile(r"^(?:•|-|–|—|\*|o|>)\s+")
 _HEADING_DECORATION = re.compile(r"^[\s#=*_\-–—:|•.]+|[\s#=*_\-–—:|•.]+$")
 _TRAILING_DECORATION = re.compile(r"[#=*_\-–—|•]\s*$")
@@ -154,6 +170,61 @@ def heading_section(line: str) -> ResumeSection | None:
 
 def _is_bullet(line: str) -> bool:
     return bool(_BULLET.match(line))
+
+
+def skill_list_line(line: str) -> bool:
+    """Whether a line is an explicit labelled list of skills.
+
+    Used only inside a Summary (see `promote_summary_skills`). Conservative by
+    design: it answers "is this a label followed by a list of short items", and
+    nothing about meaning. Nothing is invented, reworded, or inferred — a line
+    either is such a list or is left exactly where it was.
+    """
+    text = _BULLET.sub("", line).strip()
+    label, separator, payload = text.partition(":")
+    if not separator:
+        return False
+
+    label, payload = label.strip(), payload.strip()
+    if (
+        not label
+        or not label[:1].isalpha()
+        or "," in label
+        or len(label) > _SKILL_LABEL_MAX_CHARS
+        or len(label.split()) > _SKILL_LABEL_MAX_WORDS
+    ):
+        return False
+    return _short_item_list(payload, minimum=_SKILL_MIN_ITEMS)
+
+
+def _short_item_list(payload: str, *, minimum: int) -> bool:
+    """Whether `payload` is a comma-separated list of at least `minimum` short items.
+
+    A trailing comma is ignored: PDF extraction wraps a long line, so a skill list
+    routinely ends mid-list and continues on the next line.
+    """
+    items = [item.strip() for item in payload.rstrip(",").split(",")]
+    if len(items) < minimum or not all(items):
+        return False
+    return all(
+        len(item.split()) <= _SKILL_ITEM_MAX_WORDS and not _SENTENCE_STOP.search(item)
+        for item in items
+    )
+
+
+def _wrapped_skill_list(line: str) -> bool:
+    """Whether a line is the wrapped remainder of the skill list above it.
+
+    Only ever consulted while the line above is an unfinished skill list — one
+    that ended without closing a sentence. PDF extraction wraps at a fixed width,
+    so a list breaks after a comma ("… Bearer Authentication," / "CORS, Rate
+    Limiting") or inside an item ("… SQL, Data" / "Structuring"); both continue
+    the list, and neither reads as a sentence.
+    """
+    text = _BULLET.sub("", line).strip()
+    if not text or heading_section(text) is not None:
+        return False
+    return _short_item_list(text, minimum=1)
 
 
 @dataclass
@@ -199,6 +270,60 @@ def _split_sections(lines: list[_Line]) -> list[_Section]:
         else:
             sections[-1].lines.append(line)
     return [s for s in sections if any(line.text for line in s.lines)]
+
+
+def _summary_skill_lines(lines: list["_Line"]) -> set[int]:
+    """Indices of the Summary lines that are an explicit skill list.
+
+    A labelled line starts the run; the lines it wrapped onto join it, so a list
+    split by PDF line-wrapping moves in one piece instead of leaving half of it
+    stranded in the Summary — where it would be both unreachable and orphaned.
+    The run ends at the first line that closes a sentence or stops looking like a
+    list, so prose following a skills block stays in the Summary.
+    """
+    found: set[int] = set()
+    open_run = False
+    for index, line in enumerate(lines):
+        text = line.text.strip()
+        if skill_list_line(text) or (open_run and _wrapped_skill_list(text)):
+            found.add(index)
+        else:
+            open_run = False
+            continue
+        open_run = not text.rstrip().endswith((".", "!", "?"))
+    return found
+
+
+def promote_summary_skills(sections: list["_Section"]) -> list["_Section"]:
+    """Move explicit skill lists out of a Summary into a Skills section of their own.
+
+    Retrieval never returns Summary chunks, and a real resume writes its skills as
+    labelled lists *inside* the summary block — so its entire skill list was
+    unreachable as evidence. Promoting those lines fixes that without weakening
+    the Summary exclusion, which is the only chunking-level change the eval
+    measured as a gain.
+
+    The lines are moved, not copied, so each appears in exactly one chunk, and
+    their text is preserved character for character. The Summary's own heading
+    rides along, so the promoted chunk's prefix reads "[Skills (Summary)]" and the
+    evidence still says where it came from — attribution without widening the
+    schema. Summary prose stays in the Summary, and stays excluded.
+    """
+    promoted: list[_Section] = []
+    for section in sections:
+        if section.section is not ResumeSection.SUMMARY:
+            promoted.append(section)
+            continue
+        moved = _summary_skill_lines(section.lines)
+        if not moved:
+            promoted.append(section)
+            continue
+        skills = [line for index, line in enumerate(section.lines) if index in moved]
+        prose = [line for index, line in enumerate(section.lines) if index not in moved]
+        if any(line.text for line in prose):
+            promoted.append(_Section(section.section, section.heading, prose))
+        promoted.append(_Section(ResumeSection.SKILLS, section.heading, skills))
+    return promoted
 
 
 _SENTENCE_END = tuple(".!?;:")
@@ -393,7 +518,7 @@ def chunk_fixed_window(
 def chunk_pages(pages: list[str], *, merge_below: int = TARGET_MIN_TOKENS) -> ChunkedResume:
     """Section-aware chunks for text already split into pages."""
     normalized_pages = [normalize_text(page) for page in pages]
-    sections = _split_sections(_lines_with_pages(normalized_pages))
+    sections = promote_summary_skills(_split_sections(_lines_with_pages(normalized_pages)))
     recognised = [s for s in sections if s.section is not ResumeSection.HEADER]
 
     full_text = normalize_text("\n".join(normalized_pages))

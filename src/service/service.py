@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -39,6 +39,15 @@ from core import settings
 from core.settings import DatabaseType
 # Removed: # DentApp (removed) integration
 from memory import initialize_database, initialize_store, pg_manager
+from agents.xbuddy.resume import (
+    ResumeExtractionError,
+    ResumeIndexingError,
+    ResumeStore,
+    ResumeStoreError,
+    extract_pdf_text,
+)
+from agents.xbuddy.resume.candidates import extract_background_candidates
+from agents.xbuddy.resume.ingestion import index_document
 from schema import (
     CompletionInput,
     FinalOutputInput,
@@ -51,6 +60,9 @@ from schema import (
     CompletionState,
     InvokeResponse,
     PublicSection,
+    ResumeStatusInput,
+    ResumeStatusResponse,
+    ResumeUploadResponse,
     ServiceMetadata,
     StreamInput,
     UserInput,
@@ -94,7 +106,13 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         
         # Log request body for POST/PUT requests, but skip for streaming endpoints
         is_streaming_endpoint = "/stream" in str(request.url.path)
-        if request.method in ["POST", "PUT", "PATCH"] and not is_streaming_endpoint:
+        # Uploads are never logged, not even truncated: a resume PDF is personal
+        # data, and the raw-body fallback below would write its filename and the
+        # start of the file — uncompressed text in many PDFs — into the log.
+        is_multipart = request.headers.get("content-type", "").lower().startswith("multipart/")
+        if is_multipart:
+            logger.info("FRONTEND_REQUEST: Body: (multipart upload; not logged)")
+        elif request.method in ["POST", "PUT", "PATCH"] and not is_streaming_endpoint:
             try:
                 # Use the safer approach for non-streaming endpoints
                 body = await request.body()
@@ -1248,6 +1266,152 @@ async def final_output(
         f"user_id={input.user_id} ==="
     )
     return await load_final_output(agent_id, input.thread_id, input.user_id)
+
+
+# ---------------------------------------------------------------------------
+# Resume RAG
+# ---------------------------------------------------------------------------
+
+RESUME_MAX_BYTES = 2 * 1024 * 1024
+
+# A problem with the user's file is a 4xx they can act on; a failure of ours or an
+# upstream's is a 5xx. Neither is ever reported as an indexed resume.
+_RESUME_EXTRACTION_STATUS = {
+    "not_pdf": 415,
+    "unreadable": 422,
+    "encrypted": 422,
+    "too_many_pages": 413,
+    "no_text": 422,
+}
+_RESUME_INDEXING_STATUS = {
+    "no_chunks": 422,
+    "too_many_chunks": 413,
+    "embedding_failed": 502,
+    "persistence_failed": 502,
+}
+
+
+def _resume_error(status_code: int, code: str, message: str) -> HTTPException:
+    """A refusal the frontend can show as-is: a stable code and a sentence for the user."""
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
+async def _assert_resume_thread_owner(agent_id: str, thread_id: str, user_id: int) -> None:
+    """The same deny-by-default rule as /history and /completion.
+
+    A conversation whose checkpoint belongs to someone else is 404. One with no
+    checkpoint yet is allowed: a resume can be attached before the first message.
+    """
+    try:
+        agent: AgentGraph = get_agent(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id}") from exc
+    try:
+        snapshot = await agent.aget_state(
+            config=RunnableConfig(configurable={"thread_id": thread_id, "user_id": user_id})
+        )
+    except Exception as e:
+        logger.error(f"RESUME_OWNER_CHECK_ERROR: thread_id={thread_id}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Unexpected error") from e
+    values = snapshot.values or {}
+    if values and values.get("user_id") != user_id:
+        logger.warning(f"RESUME_SCOPE_MISMATCH: thread_id={thread_id} requested_by={user_id}")
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+
+@router.post("/{agent_id}/resume")
+@router.post("/resume")
+@limiter.limit(settings.RATE_LIMIT_EXPENSIVE)
+async def upload_resume(
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    user_id: Annotated[int, Form(gt=0)],
+    thread_id: Annotated[str, Form(min_length=1)],
+    agent_id: str = DEFAULT_AGENT,
+) -> ResumeUploadResponse:
+    """Attach one PDF resume to a conversation, replacing any previous one.
+
+    Rate-limited as expensive: it makes one structured-extraction model call and one
+    embedding call. Returns metadata only, and only once extraction, embedding and
+    the database write have all succeeded — every failure is an error response.
+    """
+    thread_id = thread_id.strip()
+    if not thread_id:
+        raise _resume_error(422, "invalid_thread", "A conversation is required.")
+
+    filename = file.filename or ""
+    content_type = (file.content_type or "").lower()
+    if not (filename.lower().endswith(".pdf") or content_type == "application/pdf"):
+        raise _resume_error(415, "not_pdf", "Please upload your resume as a PDF.")
+
+    await _assert_resume_thread_owner(agent_id, thread_id, user_id)
+
+    # Read one byte past the limit: enough to know it is too big, never the whole file.
+    data = await file.read(RESUME_MAX_BYTES + 1)
+    if len(data) > RESUME_MAX_BYTES:
+        raise _resume_error(413, "too_large", "That file is larger than 2 MB. Please upload a smaller PDF.")
+    if not data:
+        raise _resume_error(422, "empty", "That file is empty.")
+
+    try:
+        document = extract_pdf_text(data)
+    except ResumeExtractionError as exc:
+        raise _resume_error(_RESUME_EXTRACTION_STATUS[exc.code], exc.code, exc.message) from exc
+
+    # Unconfirmed Background candidates. Never raises; None just means Background asks
+    # the way it always has.
+    candidates = await extract_background_candidates(document.text)
+
+    try:
+        indexed = await index_document(
+            document,
+            filename=filename,
+            user_id=user_id,
+            thread_id=thread_id,
+            candidate_facts=candidates,
+        )
+    except ResumeIndexingError as exc:
+        raise _resume_error(_RESUME_INDEXING_STATUS[exc.code], exc.code, exc.message) from exc
+
+    logger.info(
+        f"RESUME_INDEXED: thread_id={thread_id} pages={indexed.page_count} "
+        f"chunks={indexed.chunk_count} candidates={'yes' if candidates else 'no'}"
+    )
+    return ResumeUploadResponse(
+        indexed=True,
+        document_id=indexed.document_id,
+        filename=indexed.filename,
+        page_count=indexed.page_count,
+        chunk_count=indexed.chunk_count,
+        indexed_at=indexed.indexed_at,
+    )
+
+
+@router.post("/{agent_id}/resume/status")
+@router.post("/resume/status")
+async def resume_status(
+    input: ResumeStatusInput, agent_id: str = DEFAULT_AGENT
+) -> ResumeStatusResponse:
+    """Whether this conversation has a resume, and its metadata.
+
+    Not rate-limited: one indexed read, no model call. A database failure is a 502,
+    not "no resume" — telling the user they have none would invite a needless
+    re-upload.
+    """
+    await _assert_resume_thread_owner(agent_id, input.thread_id, input.user_id)
+    try:
+        found = await ResumeStore().status(user_id=input.user_id, thread_id=input.thread_id)
+    except ResumeStoreError as exc:
+        raise _resume_error(502, "status_unavailable", "We couldn't check your resume right now.") from exc
+    if found is None:
+        return ResumeStatusResponse(has_resume=False)
+    return ResumeStatusResponse(
+        has_resume=True,
+        filename=found.filename,
+        page_count=found.page_count,
+        chunk_count=found.chunk_count,
+        indexed_at=found.created_at,
+    )
 
 
 @router.get("/check_agent_state/{agent_id}")

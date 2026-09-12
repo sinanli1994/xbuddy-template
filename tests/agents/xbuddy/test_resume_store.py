@@ -325,15 +325,16 @@ async def test_match_parses_rows_into_typed_chunks():
 
 @pytest.mark.asyncio
 async def test_a_summary_row_is_dropped_and_reported(caplog):
-    """The RPC excludes Summary. If one arrives, the deployed function is wrong —
-    the adapter says so rather than feeding it to the conversation."""
+    """The RPC excludes Summary and Header. If one arrives, the deployed function
+    is wrong — the adapter says so rather than feeding it to the conversation.
+    Both sections are covered in test_resume_retrieval_exclusions.py."""
     rows = [match_row(1, "summary", 0.99), match_row(2)]
     with caplog.at_level(logging.ERROR):
         chunks = await store(FakeClient(rpc_data=rows)).match(
             user_id=7, thread_id="t", query_embedding=[0.2] * D, k=3
         )
     assert [c.section for c in chunks] == [ResumeSection.EXPERIENCE]
-    assert "Summary chunk returned" in caplog.text
+    assert "summary chunk returned" in caplog.text
 
 
 @pytest.mark.asyncio

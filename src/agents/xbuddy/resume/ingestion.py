@@ -15,13 +15,14 @@ stored, so what retrieval later returns is what was scored.
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import PureWindowsPath
 from typing import Literal
 
 from .chunking import chunk_document
 from .embeddings import CachedEmbedder, EmbedBatch
 from .extraction import extract_pdf_text, normalize_text
-from .models import ResumeSection
+from .models import ExtractedDocument, ResumeSection
 from .store import ChunkRecord, ResumeStore, ResumeStoreError
 from .tokens import count_tokens
 
@@ -57,6 +58,7 @@ class IndexedResume:
     embedding_model: str
     content_sha256: str
     embedded_tokens: int
+    indexed_at: datetime
 
 
 def _default_embed_batch(texts: list[str]) -> list[list[float]]:
@@ -86,9 +88,32 @@ async def index_resume(
     `candidate_facts` are the unconfirmed Background values the upload endpoint
     extracts; they are stored alongside the resume and never written to user_data.
     """
+    document = extract_pdf_text(data)  # ResumeExtractionError propagates unchanged
+    return await index_document(
+        document,
+        filename=filename,
+        user_id=user_id,
+        thread_id=thread_id,
+        candidate_facts=candidate_facts,
+        store=store,
+        embed_batch=embed_batch,
+    )
+
+
+async def index_document(
+    document: ExtractedDocument,
+    *,
+    filename: str | None,
+    user_id: int,
+    thread_id: str,
+    candidate_facts: dict | None = None,
+    store: ResumeStore | None = None,
+    embed_batch: EmbedBatch | None = None,
+) -> IndexedResume:
+    """Index an already-extracted document. The endpoint extracts once, derives the
+    Background candidates from the same text, then calls this."""
     from core.llm import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 
-    document = extract_pdf_text(data)  # ResumeExtractionError propagates unchanged
     chunked = chunk_document(document)
 
     if not chunked.chunks:
@@ -155,4 +180,5 @@ async def index_resume(
         embedding_model=EMBEDDING_MODEL,
         content_sha256=document.content_sha256,
         embedded_tokens=embedder.stats.embedded_tokens,
+        indexed_at=stored.created_at,
     )

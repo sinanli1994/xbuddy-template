@@ -13,6 +13,7 @@ const base = {
   })),
   onNewConversation: noop, onSelectConversation: noop, onDeleteConversation: noop,
   finalPlanError: null, onViewFinalPlan: noop, onRetryFinalPlan: noop,
+  resume: null, onUploadResume: noop, onRetryResumeStatus: noop,
 };
 const sections = ['Career Goal', 'Background', 'Job Preferences', 'Skill Assessment', 'Action Plan']
   .map((name, i) => ({ id: `section-${i}`, name, status: 'done' as const }));
@@ -94,5 +95,59 @@ check('teeth: duplicate summary is rejected', () => {
 });
 check('teeth: premature View Final Plan is rejected', () => {
   assert.throws(() => assertHierarchy(render(true, true), true, false));
+});
+
+// ------------------------------------------------------------ resume card ----
+
+const meta = { filename: 'Jordan Avery CV.pdf', pageCount: 2, chunkCount: 12, indexedAt: '2026-09-11T12:00:00Z' };
+function renderResume(resume: Props['resume']) {
+  return renderToStaticMarkup(<JobBuddyProgress {...base} finalPlanReady={false} completion={null} resume={resume} />);
+}
+function assertResumePlacement(html: string) {
+  const card = html.indexOf('data-testid="resume-card"');
+  assert(card >= 0, 'missing resume card');
+  assert(html.indexOf('data-testid="completion-summary"') < card, 'resume card must follow progress');
+  assert(card < html.indexOf('+ Start a new conversation'), 'resume card must precede the new-conversation control');
+}
+
+check('no conversation selected renders no resume card', () => {
+  assert(!renderResume(null).includes('resume-card'));
+});
+check('no resume offers an upload', () => {
+  const html = renderResume({ kind: 'none' });
+  assertResumePlacement(html);
+  assert(html.includes('data-state="none"') && html.includes('>Upload PDF</button>'));
+  assert(html.includes('accept="application/pdf,.pdf"'));
+  assert(!html.includes('✓'));
+});
+check('checking shows no upload and no claim', () => {
+  const html = renderResume({ kind: 'checking' });
+  assert(html.includes('Checking for a resume') && !html.includes('>Upload PDF</button>') && !html.includes('✓'));
+});
+check('uploading names the file and claims nothing yet', () => {
+  const html = renderResume({ kind: 'uploading', filename: 'cv.pdf', previous: null });
+  assert(html.includes('Reading cv.pdf') && !html.includes('✓') && !html.includes('passages'));
+});
+check('indexed shows the filename, passage count, and Replace', () => {
+  const html = renderResume({ kind: 'indexed', meta });
+  assertResumePlacement(html);
+  assert(html.includes('✓ Jordan Avery CV.pdf') && html.includes('12 passages · 2 pages'));
+  assert(html.includes('>Replace</button>'));
+});
+check('an upload error keeps the previous resume visible as still in use', () => {
+  const html = renderResume({ kind: 'error', message: 'That PDF is password-protected.', retry: 'upload', previous: meta });
+  assert(html.includes('role="alert"') && html.includes('That PDF is password-protected.'));
+  assert(html.includes('Still using Jordan Avery CV.pdf.') && html.includes('>Choose another PDF</button>'));
+  assert(!html.includes('✓'), 'an error never renders as indexed');
+});
+check('a status error offers Retry, not "no resume"', () => {
+  const html = renderResume({ kind: 'error', message: "We couldn't check your resume right now.", retry: 'status', previous: null });
+  assert(html.includes('>Retry</button>') && !html.includes('>Upload PDF</button>') && !html.includes('Still using'));
+});
+check('teeth: a card rendered below the conversation list is rejected', () => {
+  const html = renderResume({ kind: 'indexed', meta });
+  const card = divBlock(html, 'data-testid="resume-card"');
+  const moved = html.replace(card, '').replace('<details', card + '<details');
+  assert.throws(() => assertResumePlacement(moved));
 });
 console.log(`sidebar layout: ${passed} passed, 0 failed`);

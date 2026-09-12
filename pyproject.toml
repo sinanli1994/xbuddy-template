@@ -59,6 +59,7 @@ dependencies = [
     "realtime>=1.0.0",
     "aiosqlite==0.20.0",
     "slowapi>=0.1.10",
+    "python-multipart>=0.0.18",
 ]
 
 [dependency-groups]

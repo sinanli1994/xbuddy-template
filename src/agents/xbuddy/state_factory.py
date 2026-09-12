@@ -45,6 +45,8 @@ COLD_DEFAULTS: dict[str, Callable[[], Any]] = {
     "confirmation_processed_id": lambda: None,
     "reply_intent": lambda: "CONVERSE",
     "pending_action_plan": lambda: None,
+    # Resume RAG: None until the router first looks, in Background or Skill Assessment.
+    "resume_context": lambda: None,
     # Error tracking
     "error_count": lambda: 0,
     "last_error": lambda: None,

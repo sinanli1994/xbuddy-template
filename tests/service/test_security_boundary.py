@@ -420,7 +420,13 @@ def test_both_expensive_route_forms_carry_the_limit():
     """Prefixed and bare forms share one decorated handler, so both are covered."""
     source = SERVICE_SRC.read_text(encoding="utf-8")
     decorated = re.findall(r"@limiter\.limit\(settings\.RATE_LIMIT_EXPENSIVE\)", source)
-    assert len(decorated) == 2, "expected exactly /invoke and /stream to be limited"
+    # /resume joined in Phase 8: one upload makes a structured-extraction model call
+    # and an embedding call, so it is as expensive as a chat turn.
+    assert len(decorated) == 3, "expected exactly /invoke, /stream and /resume to be limited"
+    resume_block = source[source.index('@router.post("/{agent_id}/resume")') :][:300]
+    assert "@limiter.limit(settings.RATE_LIMIT_EXPENSIVE)" in resume_block
+    status_block = source[source.index('@router.post("/{agent_id}/resume/status")') :][:300]
+    assert "@limiter.limit" not in status_block
 
     # The /{agent_id}/stream decorator is written across several lines, so anchor
     # on the path literal rather than a single-line decorator string.
