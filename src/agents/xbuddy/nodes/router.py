@@ -69,6 +69,45 @@ class _Resolution:
     is_valid_modify: bool = False
 
 
+def _stay(
+    current_section: SectionID,
+    section_states: dict[str, SectionState],
+    *,
+    normalize: bool = False,
+) -> _Resolution:
+    """`stay`, except on a section that is already finished.
+
+    The production failure this exists for: the decision model confirmed Job
+    Preferences with `is_satisfied` true but emitted `stay`. memory_updater marked
+    the section DONE, the router kept it current, and the conversation sat in a
+    completed section for the rest of its life — Skill Assessment never opened, so
+    its resume retrieval never ran and the reply model answered "based on your
+    resume" holding no resume at all.
+
+    Completion is a fact about state rather than a matter of opinion, so the router
+    treats it as one. `stay` still holds position while the section is unfinished,
+    `next` and `modify` are untouched, and an all-done conversation still holds
+    position for the final-output path.
+    """
+    active = section_states.get(current_section.value)
+    if active is None or active.status is not SectionStatus.DONE:
+        return _Resolution(current_section, normalize_to_stay=normalize)
+
+    target = get_next_unfinished_section(section_states)
+    if target is None:
+        return _Resolution(current_section, all_done=True, normalize_to_stay=normalize)
+
+    logger.info(
+        "Section %s is done; advancing to %s despite a %s directive",
+        current_section.value,
+        target.value,
+        "malformed" if normalize else "stay",
+    )
+    # `normalize` still applies: a malformed directive left in state would dead-end
+    # route_decision, so it is rewritten to stay even though the section moved.
+    return _Resolution(target, normalize_to_stay=normalize)
+
+
 def _resolve_section(
     directive: Any,
     current_section: SectionID,
@@ -79,12 +118,12 @@ def _resolve_section(
 
     if not isinstance(directive_str, str):
         logger.warning("Unrecognized router_directive %r; normalizing to stay", directive)
-        return _Resolution(current_section, normalize_to_stay=True)
+        return _stay(current_section, section_states, normalize=True)
 
     normalized = directive_str.strip().lower()
 
     if normalized == RouterDirective.STAY.value:
-        return _Resolution(current_section)
+        return _stay(current_section, section_states)
 
     if normalized == RouterDirective.NEXT.value:
         # Next *unfinished*, not next in sequence: on a cold start the directive
@@ -102,11 +141,11 @@ def _resolve_section(
             logger.warning(
                 "Invalid modify target in %r; normalizing directive to stay", directive_str
             )
-            return _Resolution(current_section, normalize_to_stay=True)
+            return _stay(current_section, section_states, normalize=True)
         return _Resolution(target, is_valid_modify=True)
 
     logger.warning("Unrecognized router_directive %r; normalizing to stay", directive_str)
-    return _Resolution(current_section, normalize_to_stay=True)
+    return _stay(current_section, section_states, normalize=True)
 
 
 async def router_node(state: XBuddyState, config: RunnableConfig) -> XBuddyState:

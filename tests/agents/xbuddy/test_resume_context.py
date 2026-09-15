@@ -24,6 +24,7 @@ from agents.xbuddy.nodes.router import router_node
 from agents.xbuddy.prompts import get_section_template
 from agents.xbuddy.resume import context as resume_context
 from agents.xbuddy.resume.context import (
+    NO_RESUME_EVIDENCE_BLOCK,
     SKILL_EVIDENCE_K,
     evidence_key,
     render_resume_block,
@@ -153,8 +154,12 @@ def test_a_confirmed_field_is_never_re_proposed():
 
 
 def test_nothing_is_proposed_once_background_is_confirmed():
+    """Confirmed fields are never re-proposed. What remains is the guard: a resume
+    is on file, so the reply is told it has nothing from it to work with here."""
     confirmed = XBuddyData(current_role="r", years_experience=3, highest_education="e", work_history=["w"])
-    assert background_block(confirmed) is None
+    block = background_block(confirmed)
+    assert block == NO_RESUME_EVIDENCE_BLOCK
+    assert BACKGROUND_HEADER not in block
 
 
 def test_unstated_years_are_not_proposed_and_must_be_asked_for():
@@ -166,18 +171,18 @@ def test_unstated_years_are_not_proposed_and_must_be_asked_for():
 def test_background_block_needs_a_resume_and_candidates():
     assert render_resume_block(SectionID.BACKGROUND, None, XBuddyData()) is None
     assert render_resume_block(SectionID.BACKGROUND, ResumeContext(document_id=None), XBuddyData()) is None
-    assert render_resume_block(SectionID.BACKGROUND, ResumeContext(document_id="d"), XBuddyData()) is None
+    assert render_resume_block(SectionID.BACKGROUND, ResumeContext(document_id="d"), XBuddyData()) == NO_RESUME_EVIDENCE_BLOCK
 
 
 @pytest.mark.parametrize("section", [SectionID.CAREER_GOAL, SectionID.JOB_PREFERENCES, SectionID.ACTION_PLAN])
-def test_other_sections_never_get_resume_material(section):
+def test_other_sections_get_the_guard_and_never_resume_material(section):
     data = XBuddyData(target_roles=["AI Engineer"])
     context = ResumeContext(
         document_id="doc-1", candidate_facts=CANDIDATES,
         evidence=[ResumeEvidence(chunk_index=5, section="projects", content="x", similarity=0.9)],
         evidence_key=evidence_key("doc-1", SectionID.SKILL_ASSESSMENT, skill_query(data)),
     )
-    assert render_resume_block(section, context, data) is None
+    assert render_resume_block(section, context, data) == NO_RESUME_EVIDENCE_BLOCK
 
 
 # --------------------------------------------------------------------------
@@ -214,7 +219,7 @@ def test_a_summary_passage_can_never_appear():
 def test_evidence_for_an_old_query_is_not_shown():
     old = XBuddyData(target_roles=["Data Analyst"])
     new = XBuddyData(target_roles=["AI Engineer"])
-    assert render_resume_block(SectionID.SKILL_ASSESSMENT, skill_context(old), new) is None
+    assert render_resume_block(SectionID.SKILL_ASSESSMENT, skill_context(old), new) == NO_RESUME_EVIDENCE_BLOCK
 
 
 def test_the_query_names_the_section_purpose_and_confirmed_roles():
@@ -340,7 +345,7 @@ async def test_a_raising_retrieval_degrades_to_no_evidence_and_retries(resume_ba
     first = await resolve(resume_backend, SectionID.SKILL_ASSESSMENT, messages=H1)
     assert first.context.document_id == "doc-1"
     assert first.context.evidence == [] and first.context.evidence_key is None
-    assert render_resume_block(SectionID.SKILL_ASSESSMENT, first.context, XBuddyData(target_roles=["AI Engineer"])) is None
+    assert render_resume_block(SectionID.SKILL_ASSESSMENT, first.context, XBuddyData(target_roles=["AI Engineer"])) == NO_RESUME_EVIDENCE_BLOCK
     resume_backend.fail_retrieve = False
     second = await resolve(resume_backend, SectionID.SKILL_ASSESSMENT, messages=H2, cached=first.context)
     assert second.context.evidence and len(resume_backend.retrieve_calls) == 2
@@ -489,3 +494,63 @@ async def test_the_reply_model_sees_the_block(reply_model, resume_backend):
     reply_update = await generate_reply_node(state, {"configurable": {}})
     assert BACKGROUND_HEADER in reply_model.last_system_prompt
     assert "user_data" not in reply_update
+
+
+# --------------------------------------------------------------------------
+# No evidence must never become invented evidence (production regression)
+# --------------------------------------------------------------------------
+
+
+def test_the_guard_forbids_claiming_resume_support():
+    """Production: with no evidence in the prompt, the reply still said "Based on
+    your resume" and named TensorFlow and PyTorch, neither of which it contains."""
+    text = " ".join(NO_RESUME_EVIDENCE_BLOCK.split())
+    assert text.startswith("NO RESUME EVIDENCE FOR THIS SECTION")
+    assert 'Do not say or imply that anything you write is "based on your resume"' in text
+    assert "never guess at its contents from the user's target role" in text
+    assert "Ask the user instead" in text
+
+
+def test_a_conversation_without_a_resume_still_gets_nothing():
+    """The guard is for a resume with nothing to show. With no resume at all the
+    prompt stays byte-identical to the pre-Resume-RAG one."""
+    for section in SectionID:
+        assert render_resume_block(section, None, XBuddyData()) is None
+        assert render_resume_block(section, ResumeContext(document_id=None), XBuddyData()) is None
+
+
+@pytest.mark.asyncio
+async def test_a_non_resume_section_carries_the_guard_not_evidence(resume_backend):
+    """Job Preferences does no retrieval, so it must say so rather than let the
+    model fill the silence."""
+    resume_backend.status = status()
+    state = graph_state(SectionID.BACKGROUND)  # a resume is on file for this thread
+    _, after_background = await route(state)
+
+    job_prefs = {**after_background, "current_section": SectionID.JOB_PREFERENCES,
+                 "router_directive": "stay"}
+    update, _ = await route(job_prefs)
+    prompt = update["context_packet"].system_prompt
+
+    assert "NO RESUME EVIDENCE FOR THIS SECTION" in prompt
+    assert EVIDENCE_HEADER not in prompt and BACKGROUND_HEADER not in prompt
+    assert resume_backend.retrieve_calls == []  # still no retrieval outside the resume sections
+
+
+@pytest.mark.asyncio
+async def test_advancing_off_a_done_section_reaches_skill_assessment_evidence(resume_backend):
+    """The two fixes together: a finished Job Preferences advances, and Skill
+    Assessment then retrieves and renders real evidence."""
+    resume_backend.status, resume_backend.evidence = status(), EVIDENCE
+    state = graph_state(SectionID.SKILL_ASSESSMENT)  # career goal..job preferences DONE
+    state.update({"current_section": SectionID.JOB_PREFERENCES, "router_directive": "stay"})
+
+    update, merged = await route(state)
+
+    assert update["current_section"] is SectionID.SKILL_ASSESSMENT
+    prompt = update["context_packet"].system_prompt
+    assert EVIDENCE_HEADER in prompt
+    assert "JobBuddy" in prompt
+    assert "NO RESUME EVIDENCE FOR THIS SECTION" not in prompt
+    assert merged["resume_context"].evidence_key is not None
+    assert merged["resume_context"].evidence
