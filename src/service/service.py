@@ -39,6 +39,7 @@ from core import settings
 from core.settings import DatabaseType
 # Removed: # DentApp (removed) integration
 from memory import initialize_database, initialize_store, pg_manager
+from service.warmup import warm_request_dependencies
 from agents.xbuddy.resume import (
     ResumeExtractionError,
     ResumeIndexingError,
@@ -218,6 +219,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Configurable lifespan that initializes the appropriate database checkpointer and store
     based on settings.
     """
+    # Pay the one-time import of the model-provider stack (and build the Supabase
+    # client) here, before the app accepts requests. Left to the first request, it
+    # stalled the single worker for ~10 s and failed a health probe. Off the event
+    # loop; see service/warmup.py for the measurements and failure semantics.
+    await asyncio.to_thread(warm_request_dependencies)
+
     # Initialize Realtime worker if enabled
     realtime_worker = None
     if settings.USE_SUPABASE_REALTIME:
