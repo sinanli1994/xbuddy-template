@@ -1,0 +1,38 @@
+Sam Okafor
+Montréal, QC | sam.okafor@example.com | (514) 555-0142
+
+Profile:
+Data analyst with five years of experience turning messy retail and healthcare data into decisions. I build SQL models and dashboards that business teams actually use, and I want to grow into an analytics engineering role.
+
+Work Experience:
+Data Analyst, Maple Retail Group
+Montréal, QC | Aug 2021 – Present
+• Built and maintain 25 Tableau dashboards used weekly by merchandising and finance leadership.
+• Modelled sales and inventory data in dbt on Snowflake, replacing 40 hand-maintained spreadsheets.
+• Designed and analysed A/B tests for the loyalty program; a pricing test lifted repeat purchases by 6%.
+• Automated the monthly store performance report with Python and Airflow, saving the team two days every month.
+• Present findings to directors and translate their questions into analysis plans.
+
+Junior Analyst, Harbor Health Network
+Toronto, ON | Jun 2019 – Jul 2021
+• Cleaned and reconciled patient-survey data from 11 clinics in Excel and SQL Server.
+• Produced quarterly reports on wait times that informed staffing changes at three clinics.
+• Trained six clinic managers to use the new reporting portal.
+
+Projects:
+Customer Churn Model
+• Trained a gradient-boosted churn model in scikit-learn on 200,000 loyalty accounts; precision of 0.71 at the top decile.
+• Wrote up the feature importance analysis for the marketing team.
+
+Toronto Transit Delays Dashboard
+• Built a public Power BI dashboard on open TTC delay data, viewed by 4,000 people.
+
+Education:
+Bachelor of Science in Statistics, McGill University, 2019
+
+Technical Skills:
+SQL (advanced), Python (pandas, scikit-learn), dbt, Snowflake, Tableau, Power BI, Airflow, Excel, Git
+
+Certifications:
+Google Data Analytics Professional Certificate (2020)
+dbt Fundamentals (2023)

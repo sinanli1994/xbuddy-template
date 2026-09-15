@@ -3,6 +3,8 @@
 import React from 'react';
 import type { CompletionState, PublicSection } from '@/components/ChatArea';
 import type { DemoConversation } from '@/utils/demoConversations';
+import type { ResumeView } from '@/utils/resume';
+import ResumeCard from '@/components/ResumeCard';
 
 /**
  * The five areas JobBuddy covers, shown as a neutral roadmap before the backend has
@@ -55,6 +57,10 @@ interface Props {
   finalPlanError: string | null;
   onViewFinalPlan: () => void;
   onRetryFinalPlan: () => void;
+  /** The selected conversation's resume, or null when none is selected. */
+  resume: ResumeView | null;
+  onUploadResume: (file: File) => void;
+  onRetryResumeStatus: () => void;
 }
 
 function SectionHeading({ children }: { children: React.ReactNode }) {
@@ -86,6 +92,9 @@ export default function JobBuddyProgress({
   finalPlanError,
   onViewFinalPlan,
   onRetryFinalPlan,
+  resume,
+  onUploadResume,
+  onRetryResumeStatus,
 }: Props) {
   const sections = completion?.sections ?? [];
 
@@ -254,6 +263,14 @@ export default function JobBuddyProgress({
           )}
         </div>
       </div>
+
+      {/* 2b. Resume — belongs to this conversation, so it sits with its progress. */}
+      {resume && (
+        <div style={{ flexShrink: 0 }}>
+          <SectionHeading>Your Resume</SectionHeading>
+          <ResumeCard view={resume} onUpload={onUploadResume} onRetryStatus={onRetryResumeStatus} />
+        </div>
+      )}
 
       {/* 3. New conversation — between progress and the list, per the reference UI. */}
       <button

@@ -55,6 +55,7 @@ def fully_populated_state() -> dict:
         "confirmation_processed_id": None,
         "reply_intent": "CONVERSE",
         "pending_action_plan": None,
+        "resume_context": None,
         "error_count": 0,
         "last_error": None,
         "final_output": None,

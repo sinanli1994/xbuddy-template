@@ -81,7 +81,10 @@ async def test_prompt_carries_the_recent_window_and_section_context(
     sent = extraction_chain.calls[-1]
     window = sent[1:]  # index 0 is the SystemMessage
     assert len(window) == EXTRACTION_WINDOW_SIZE
-    assert window == history[-EXTRACTION_WINDOW_SIZE:]
+    # The history ends with this turn's reply ("reply 13"); the window ends at the
+    # user's latest message before it.
+    assert window == history[:13][-EXTRACTION_WINDOW_SIZE:]
+    assert window[-1].content == "msg 12"
 
     prompt = extraction_chain.last_system_prompt
     assert "CURRENT SECTION: career_goal" in prompt
@@ -89,6 +92,44 @@ async def test_prompt_carries_the_recent_window_and_section_context(
     # Already-stored values are shown so corrections are distinguishable.
     assert "ALREADY STORED FOR THIS SECTION" in prompt
     assert "target_roles" in prompt
+
+
+@pytest.mark.asyncio
+async def test_this_turns_reply_never_reaches_extraction(extraction_chain, make_state):
+    """Found in the live Resume RAG run: the reply suggested resume-derived
+    strengths, and the extraction model, shown that reply, recorded them before
+    the user had answered. The user cannot have agreed to a reply they have not
+    seen, so it is cut structurally."""
+    extraction_chain.extracted = None
+    history = [
+        AIMessage(content="What are you genuinely good at?"),
+        HumanMessage(content="Backend system design. What else would you count?"),
+        AIMessage(content="From your resume, I'd count RAG prototyping as a strength."),
+    ]
+
+    await memory_updater_node(make_state(section=SectionID.SKILL_ASSESSMENT, messages=history), {})
+
+    sent = extraction_chain.calls[-1][1:]
+    assert sent == history[:2]
+    assert all("RAG prototyping" not in str(m.content) for m in extraction_chain.calls[-1])
+
+
+@pytest.mark.asyncio
+async def test_a_confirmation_still_sees_the_summary_it_confirms(extraction_chain, make_state):
+    extraction_chain.extracted = career_goal()
+    summary = AIMessage(content="Target role: SRE; timeline: 6 months. Does that look right?")
+    history = [HumanMessage(content="SRE, in 6 months"), summary, HumanMessage(content="Yes."),
+               AIMessage(content="Great — on to your background.")]
+
+    await memory_updater_node(make_state(messages=history), {})
+
+    assert extraction_chain.calls[-1][1:] == history[:3]
+
+
+@pytest.mark.asyncio
+async def test_no_user_message_means_no_extraction_call(extraction_chain, make_state):
+    await memory_updater_node(make_state(messages=[AIMessage(content="Hi! What role are you after?")]), {})
+    assert extraction_chain.calls == []
 
 
 @pytest.mark.asyncio

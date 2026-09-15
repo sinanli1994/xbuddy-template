@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal, NotRequired
 
 from pydantic import BaseModel, Field
@@ -388,3 +389,42 @@ class RefineSectionInput(BaseModel):
         min_length=1,
         examples=["Make it more concise", "Add more details about the target audience"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Resume RAG
+# ---------------------------------------------------------------------------
+
+
+class ResumeUploadResponse(BaseModel):
+    """What an indexed upload reports. Metadata only — never resume text or facts.
+
+    Returned only after extraction, embedding, and the database write all
+    succeeded; any failure is an error response instead, so `indexed` is never
+    false here.
+    """
+
+    indexed: bool = Field(description="Always true: failures are error responses.")
+    document_id: str
+    filename: str
+    page_count: int
+    chunk_count: int = Field(description="Retrievable passages, shown as 'N passages'.")
+    indexed_at: datetime
+
+
+class ResumeStatusInput(BaseModel):
+    """Which conversation's resume to describe. Its own model, like CompletionInput."""
+
+    thread_id: str = Field(min_length=1, description="Conversation whose resume is being read.")
+    user_id: int = Field(gt=0, description="User the conversation must belong to.")
+
+
+class ResumeStatusResponse(BaseModel):
+    """Whether this conversation has a resume, and its metadata. Never its content,
+    and never the unconfirmed candidate facts extracted from it."""
+
+    has_resume: bool
+    filename: str | None = None
+    page_count: int | None = None
+    chunk_count: int | None = None
+    indexed_at: datetime | None = None

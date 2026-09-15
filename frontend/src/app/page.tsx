@@ -16,6 +16,15 @@ import {
   type DemoConversation,
   type DemoIdentity,
 } from '@/utils/demoConversations';
+import {
+  checkResumeFile,
+  currentResume,
+  errorMessageFrom,
+  metaFromResponse,
+  resumeForThread,
+  type ResumeView,
+  type ThreadResume,
+} from '@/utils/resume';
 
 interface Section {
   database_id: number;
@@ -33,9 +42,9 @@ interface BackendMessage {
 /**
  * The JobBuddy demo.
  *
- * Browser -> /api/chat, /api/history and /api/completion (Next server routes) -> Fly
- * backend. The bearer token lives only in those routes; nothing here knows it, and
- * nothing here talks to Supabase.
+ * Browser -> /api/chat, /api/history, /api/completion, /api/final-output and
+ * /api/resume(/status) (Next server routes) -> Fly backend. The bearer token lives
+ * only in those routes; nothing here knows it, and nothing here talks to Supabase.
  *
  * Viewport ownership is singular: `html, body { height: 100%; overflow: hidden }` in
  * globals.css, and every container below derives from it with `height: 100%`. Nothing
@@ -56,6 +65,9 @@ export default function JobBuddyDemo() {
   const [planError, setPlanError] = useState<string | null>(null);
   const [planOpen, setPlanOpen] = useState(false);
   const planFetches = useRef(new Set<string>());
+  // Tagged with its thread and shown only while that thread is selected, so one
+  // conversation's resume can never appear in another. Memory only, like the plan.
+  const [resume, setResume] = useState<ThreadResume | null>(null);
   // Invalidate reads/events from a selection that was deleted or switched away.
   const selectionVersion = useRef(0);
   const selectionAtRender = selectionVersion.current;
@@ -116,10 +128,56 @@ export default function JobBuddyDemo() {
     }
   }, []);
 
+  /** Replace the resume view, but only if the stored one is still this thread's. */
+  const updateResume = useCallback((threadId: string, view: ResumeView) => {
+    setResume((prev) => (prev?.threadId === threadId ? { threadId, view } : prev));
+  }, []);
+
+  /**
+   * Read whether this thread has a resume. One indexed read on the backend — no
+   * model call. A failure is shown as a failure, never as "no resume", which would
+   * invite a needless re-upload.
+   */
+  const loadResumeStatus = useCallback(async (id: DemoIdentity) => {
+    const version = selectionVersion.current;
+    const failed: ResumeView = {
+      kind: 'error',
+      message: "We couldn't check your resume right now.",
+      retry: 'status',
+      previous: null,
+    };
+    setResume({ threadId: id.threadId, view: { kind: 'checking' } });
+    try {
+      const response = await fetch('/api/resume/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread_id: id.threadId, user_id: id.userId }),
+      });
+      const data = await response.json().catch(() => null);
+      if (version !== selectionVersion.current) return;
+      if (!response.ok) {
+        updateResume(id.threadId, { ...failed, message: errorMessageFrom(data, response.status) });
+        return;
+      }
+      if (data?.has_resume !== true) {
+        updateResume(id.threadId, { kind: 'none' });
+        return;
+      }
+      const meta = metaFromResponse(data);
+      updateResume(id.threadId, meta ? { kind: 'indexed', meta } : failed);
+    } catch {
+      if (version !== selectionVersion.current) return;
+      updateResume(id.threadId, failed);
+    }
+  }, [updateResume]);
+
   const restore = useCallback(async (id: DemoIdentity) => {
     const version = selectionVersion.current;
     setRestoreState('loading');
     setRestoreError(null);
+    // Beside history and completion, not inside their Promise.all: a resume status
+    // failure must never fail the conversation's restore.
+    void loadResumeStatus(id);
 
     const payload = {
       method: 'POST',
@@ -189,7 +247,7 @@ export default function JobBuddyDemo() {
       setRestoreError(error instanceof Error ? error.message : 'Could not load your conversation');
       setRestoreState('error');
     }
-  }, [loadFinalPlan]);
+  }, [loadFinalPlan, loadResumeStatus]);
 
   useEffect(() => {
     // The persisted active selection wins. Nothing used to record which thread was
@@ -218,6 +276,7 @@ export default function JobBuddyDemo() {
     setFinalPlan(null);
     setPlanError(null);
     setPlanOpen(false);
+    setResume(null);
   };
 
   const handleNewConversation = () => {
@@ -227,8 +286,64 @@ export default function JobBuddyDemo() {
     const id = mintIdentity();
     rememberConversation(id.threadId, id.userId);
     selectLocally(id);
+    // A freshly minted thread cannot have a resume yet, so there is nothing to ask.
+    setResume({ threadId: id.threadId, view: { kind: 'none' } });
     setRestoreState('ready');
     setConversations(listConversations());
+  };
+
+  /**
+   * Upload a resume for the selected conversation, replacing any it had.
+   *
+   * The file goes to /api/resume only — never into the chat. The card says
+   * "indexed" only when the backend confirmed it; a failed replace leaves the
+   * previous resume in effect, because the backend swaps documents atomically.
+   */
+  const handleUploadResume = async (file: File) => {
+    if (!identity) return;
+    const id = identity;
+    const version = selectionVersion.current;
+    const previous = currentResume(resumeForThread(resume, id.threadId));
+
+    const refusal = checkResumeFile(file);
+    if (refusal) {
+      updateResume(id.threadId, { kind: 'error', message: refusal, retry: 'upload', previous });
+      return;
+    }
+
+    updateResume(id.threadId, { kind: 'uploading', filename: file.name, previous });
+    const form = new FormData();
+    form.append('file', file);
+    form.append('thread_id', id.threadId);
+    form.append('user_id', String(id.userId));
+
+    try {
+      // No Content-Type: the browser sets it, with the multipart boundary.
+      const response = await fetch('/api/resume', { method: 'POST', body: form });
+      const data = await response.json().catch(() => null);
+      if (version !== selectionVersion.current) return;
+      if (response.ok) {
+        const meta = data?.indexed === true ? metaFromResponse(data) : null;
+        // An unreadable success is not guessed at: ask the backend what is on file.
+        if (meta) updateResume(id.threadId, { kind: 'indexed', meta });
+        else void loadResumeStatus(id);
+        return;
+      }
+      updateResume(id.threadId, {
+        kind: 'error',
+        message: errorMessageFrom(data, response.status),
+        retry: 'upload',
+        previous,
+      });
+    } catch {
+      if (version !== selectionVersion.current) return;
+      updateResume(id.threadId, {
+        kind: 'error',
+        message: 'Could not reach JobBuddy. Please try again.',
+        retry: 'upload',
+        previous,
+      });
+    }
   };
 
   const handleFirstUserMessage = useCallback((content: string) => {
@@ -318,6 +433,9 @@ export default function JobBuddyDemo() {
           finalPlanError={planError}
           onViewFinalPlan={() => setPlanOpen(true)}
           onRetryFinalPlan={() => identity && void loadFinalPlan(identity)}
+          resume={resumeForThread(resume, identity?.threadId ?? null)}
+          onUploadResume={(file) => void handleUploadResume(file)}
+          onRetryResumeStatus={() => identity && void loadResumeStatus(identity)}
         />
 
         {restoreState === 'error' && (

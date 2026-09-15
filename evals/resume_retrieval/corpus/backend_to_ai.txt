@@ -1,0 +1,53 @@
+JORDAN AVERY
+Toronto, ON | jordan.avery@example.com | github.com/javery-dev | linkedin.com/in/jordanavery
+Senior Backend Engineer moving into AI engineering
+SUMMARY
+Backend engineer with 8 years of experience building payment and logistics platforms in Python, Go and Java. For the past two years I have been shipping LLM features in production and building agentic applications end to end, from retrieval pipelines to deployment and evaluation.
+EXPERIENCE
+Senior Backend Engineer — Northwind Logistics
+Toronto, ON | Mar 2020 – Present
+• Own the shipment-tracking platform: 14 Python and Go services handling 40 million events per day.
+• Designed an event pipeline on Kafka and PostgreSQL that cut end-to-end tracking latency from 9 minutes to 45 seconds.
+• Built an LLM-powered support assistant that drafts carrier emails; retrieval over 12,000 past tickets reduced average handling time by 31%.
+• Introduced offline evaluation for the assistant with a labelled test set, catching two regressions before release.
+• Mentor four engineers and run the weekly architecture review; promoted two mentees to intermediate.
+• Led the migration from a monolith to services with zero customer-facing downtime.
+• Cut cloud spend by 28% by moving batch workloads to spot instances and right-sizing the PostgreSQL fleet.
+• Wrote the incident-response runbook and chaired twelve blameless post-mortems.
+Backend Engineer (contract) — Lumen Health
+Remote | Mar 2019 – Feb 2020
+• Built HL7 and FHIR integration services in Go that synchronised appointment data between 60 clinics and a central scheduling system.
+• Wrote the data-retention job that purged expired records to meet provincial privacy rules, with an audit trail reviewed by the compliance team.
+• Paired with the mobile team to design a versioned public API; no breaking changes shipped in eleven releases.
+Backend Engineer — Brightpath Payments
+Waterloo, ON | Jun 2017 – Feb 2019
+• Built REST APIs in Java and Spring Boot for merchant onboarding, serving 3,000 merchants.
+• Reduced payment authorization p99 latency from 800 ms to 210 ms by rewriting the fraud-check cache.
+• Maintained PCI-DSS compliance controls and handled on-call rotations for the payments core.
+Software Engineering Intern — Maple Analytics
+Toronto, ON | May 2016 – Aug 2016
+• Wrote ETL jobs in Python that loaded retail sales data into a reporting warehouse.
+PROJECTS
+JobBuddy — AI career-coaching agent
+• Built a stateful multi-step coaching agent with LangGraph, persisting conversation state in PostgreSQL through a checkpointer.
+• Served it with FastAPI and token-by-token Server-Sent Events streaming; deployed the backend to Fly.io and the Next.js frontend to Vercel.
+• Added LangSmith tracing and a regression eval suite that runs on every change.
+Internal Docs Q&A (hackathon, 1st place)
+• Prototyped retrieval-augmented question answering over 3,000 engineering wiki pages with pgvector and OpenAI embeddings.
+• Measured answer quality with a 50-question labelled set; recall@5 of 0.84.
+Open-source: pg-outbox
+• Maintain a small Python library implementing the transactional outbox pattern for PostgreSQL; 600 GitHub stars and used in production by three companies.
+EDUCATION
+Bachelor of Applied Science, Computer Engineering — University of Waterloo, 2017
+SKILLS
+Languages: Python, Go, Java, SQL, TypeScript
+Frameworks: FastAPI, Spring Boot, LangGraph, LangChain, Next.js
+Data: PostgreSQL, pgvector, Kafka, Redis
+Cloud and DevOps: Docker, AWS, Fly.io, Vercel, GitHub Actions, Terraform
+CERTIFICATIONS
+AWS Certified Solutions Architect – Associate (2022)
+TALKS
+Checkpointing LangGraph agents in Postgres — Toronto Python Meetup, 2025
+From monolith to event streams without downtime — PyCon Canada, 2022
+AWARDS
+Northwind Engineering Excellence Award, 2023

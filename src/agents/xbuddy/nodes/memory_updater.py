@@ -259,6 +259,23 @@ def _known_values(packet: ContextPacket, user_data: XBuddyData) -> str:
     return "\n".join(lines) if lines else "- (this section declares no required fields)"
 
 
+def _extraction_window(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """The recent exchange, ending at the user's latest message.
+
+    memory_updater runs after generate_reply, so the history ends with the reply
+    this turn just produced. The user cannot have agreed to anything in it yet, so
+    it is cut here rather than left to EXTRACTION_RULES' "not the user's answer"
+    rule: a real model shown "from your resume, I'd count RAG as a strength"
+    recorded it as a strength before the user had said a word about it.
+    A confirmation still works — what it confirms was shown in an earlier turn,
+    before the user's reply.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            return messages[: index + 1][-EXTRACTION_WINDOW_SIZE:]
+    return []
+
+
 def _build_prompt(
     packet: ContextPacket, user_data: XBuddyData, messages: list[BaseMessage]
 ) -> list[BaseMessage]:
@@ -267,7 +284,7 @@ def _build_prompt(
         f"CURRENT SECTION: {packet.section_id.value}\n\n"
         f"ALREADY STORED FOR THIS SECTION\n{_known_values(packet, user_data)}"
     )
-    window = messages[-EXTRACTION_WINDOW_SIZE:]
+    window = _extraction_window(messages)
     return [SystemMessage(content=f"{EXTRACTION_RULES.strip()}\n\n{context}"), *window]
 
 
@@ -465,12 +482,12 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
         candidate = before.model_copy(update={"action_items": accepted}, deep=True)
         merged = candidate if extraction_changed(before, candidate) else None
         logger.info("memory_updater: confirmed stored Action Plan (%d steps)", len(accepted))
-    elif messages:
+    elif _extraction_window(messages):
         merged, extraction_error = await _extract(packet, before, messages, config)
         if extraction_error is not None:
             errors.append(extraction_error)
     else:
-        logger.debug("memory_updater: empty message history; nothing to extract")
+        logger.debug("memory_updater: the user has said nothing yet; nothing to extract")
 
     effective_data = merged if merged is not None else before
     decision_output = state.get("agent_output")

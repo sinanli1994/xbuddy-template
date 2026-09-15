@@ -61,12 +61,20 @@ def render_known_data(user_data: XBuddyData) -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt(template: SectionTemplate, user_data: XBuddyData | None = None) -> str:
+def build_system_prompt(
+    template: SectionTemplate,
+    user_data: XBuddyData | None = None,
+    resume_block: str | None = None,
+) -> str:
     """Compose BASE_RULES + the section's own prompt + what is already known.
 
     The section template is inserted literally — never through `str.format()` —
     because prompts contain literal braces (JSON and Tiptap examples) that would
     raise KeyError/IndexError.
+
+    `resume_block` (Resume RAG) is appended *after* KNOWN SO FAR as its own section,
+    and only when present. It holds unconfirmed resume material, which must never be
+    presented as known; without a resume the prompt is byte-identical to before.
     """
     parts = [BASE_RULES.strip(), template.system_prompt_template.strip()]
 
@@ -75,6 +83,9 @@ def build_system_prompt(template: SectionTemplate, user_data: XBuddyData | None 
         parts.append(f"KNOWN SO FAR\n{known}")
     else:
         parts.append("KNOWN SO FAR\nNothing collected yet — this is the start of the conversation.")
+
+    if resume_block:
+        parts.append(resume_block.strip())
 
     return "\n\n".join(parts)
 
@@ -97,13 +108,14 @@ def build_context_packet(
     status: SectionStatus = SectionStatus.PENDING,
     draft: SectionContent | None = None,
     user_data: XBuddyData | None = None,
+    resume_block: str | None = None,
 ) -> ContextPacket:
     """Build the ContextPacket the reply node consumes for a section."""
     template = get_section_template(section_id)
     return ContextPacket(
         section_id=template.section_id,
         status=SectionStatus(status),
-        system_prompt=build_system_prompt(template, user_data),
+        system_prompt=build_system_prompt(template, user_data, resume_block),
         draft=draft,
         validation_rules=build_validation_rules(template),
     )
