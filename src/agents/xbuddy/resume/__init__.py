@@ -11,7 +11,8 @@ Retrieval design, fixed by the labelled eval in evals/resume_retrieval/:
 section-aware chunks, text-embedding-3-small at 1536 dimensions, exact cosine,
 Summary excluded at retrieval time, top-3.
 
-Not yet wired into the upload endpoint, the frontend, or the LangGraph workflow.
+Resume RAG is integrated into the JobBuddy upload and LangGraph workflow, providing
+unconfirmed Background candidates and retrieved evidence for grounded Skill Assessment.
 """
 
 from .chunking import chunk_document, chunk_fixed_window, chunk_pages, chunk_text
