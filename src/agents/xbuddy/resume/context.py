@@ -75,6 +75,18 @@ HOW TO USE THEM
   add anything the passages do not contain. Ignore a passage that is not relevant.
 - A skill is recorded only when the user says so. Their self-assessment decides."""
 
+NO_RESUME_EVIDENCE_BLOCK = """NO RESUME EVIDENCE FOR THIS SECTION
+The user has a resume on file, but nothing from it is available for this part of
+the conversation.
+
+HOW TO HANDLE THAT
+- Do not say or imply that anything you write is "based on your resume", and do
+  not present anything as something the resume shows.
+- Do not attribute a skill, technology, project, responsibility or strength to the
+  resume here, and never guess at its contents from the user's target role.
+- Ask the user instead, and work from what they tell you."""
+
+
 # Injected so tests steer them; production uses the store and the retrieval helper.
 StatusLookup = Callable[[int, str], Awaitable[Any]]
 Retrieve = Callable[[int, str, str, int], Awaitable[list]]
@@ -156,10 +168,17 @@ async def resolve_resume_context(
     """Resolve this turn's resume context. Never raises."""
     current = coerce_resume_context(cached)
 
-    # Only the two resume sections pay for a lookup; everywhere else the cache is
-    # left exactly as it is and nothing is rendered.
-    if section not in RESUME_SECTIONS or not user_id or not thread_id or not resume_rag_configured():
+    if not user_id or not thread_id or not resume_rag_configured():
         return ResumeResolution(None, False)
+
+    # Only the two resume sections pay for a lookup. Everywhere else the cached
+    # context is passed straight through — no I/O, no state write — because the
+    # reply still has to know a resume exists. Without that, a section with no
+    # evidence claims resume support it was never given: in production, Job
+    # Preferences answered "based on your resume" and named TensorFlow and PyTorch,
+    # neither of which the resume contains.
+    if section not in RESUME_SECTIONS:
+        return ResumeResolution(current, False)
 
     lookup = fetch_status or _fetch_status
     search = retrieve or _retrieve
@@ -230,7 +249,18 @@ def _render_value(value: Any) -> str:
 def render_resume_block(
     section: SectionID, context: ResumeContext | None, user_data: XBuddyData
 ) -> str | None:
-    """The conditional prompt block for this section, or None for no block at all."""
+    """The conditional prompt block for this section, or None for no block at all.
+
+    When a resume is on file but this turn has no block to show — no unconfirmed
+    candidates left, or no retrieved evidence — the reply still gets the
+    NO_RESUME_EVIDENCE guard. In production a model in that position answered
+    "Based on your resume…" and named TensorFlow and PyTorch, neither of which
+    the resume contains: the presence of a resume invites the claim, so the
+    absence of evidence has to be stated rather than left silent.
+
+    A conversation with no resume at all still gets nothing, so its prompt stays
+    byte-identical to the pre-Resume-RAG one.
+    """
     if context is None or not context.document_id:
         return None
 
@@ -243,17 +273,17 @@ def render_resume_block(
             if _is_empty(getattr(user_data, name, None))
             and not _is_empty(context.candidate_facts.get(name))
         ]
-        return BACKGROUND_BLOCK.format(facts="\n".join(lines)) if lines else None
+        return BACKGROUND_BLOCK.format(facts="\n".join(lines)) if lines else NO_RESUME_EVIDENCE_BLOCK
 
     if section is SectionID.SKILL_ASSESSMENT and context.evidence:
         # Evidence is shown only for the exact document, section, and query it was
         # retrieved for — never carried into another section or a changed query.
         if context.evidence_key != evidence_key(context.document_id, section, skill_query(user_data)):
-            return None
+            return NO_RESUME_EVIDENCE_BLOCK
         passages = [e for e in context.evidence if e.section != "summary"]  # the RPC excludes it too
         if not passages:
-            return None
+            return NO_RESUME_EVIDENCE_BLOCK
         rendered = "\n".join(f"[{n}] {e.content.strip()}" for n, e in enumerate(passages, start=1))
         return EVIDENCE_BLOCK.format(passages=rendered)
 
-    return None
+    return NO_RESUME_EVIDENCE_BLOCK
