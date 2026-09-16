@@ -192,6 +192,16 @@ salary, their location, their seniority, their employer, or their skills. Do not
 infer a fact from a job title, and do not convert something plausible into
 something stated.
 
+Total professional experience is not tenure in any one role. Never attach that
+figure to a specific role, title, employer, or specialization — "5 years as an AI
+Engineer", "5 years of AI engineering experience" — unless FACTS state that tenure
+explicitly. Say it as total experience ("about 5 years of professional
+experience") and, if useful, name the current role separately.
+
+"Target industries: open to any industry" means the user has no preferred industry.
+Describe them as open across industries; never present a specific industry as
+one they want.
+
 CONFIRMED ACTION PLAN
 Steps the user already reviewed and agreed to, in the order they agreed. These are
 not yours to edit. You annotate them: one entry per numbered step, with
@@ -209,7 +219,8 @@ RECOMMENDATIONS ARE ALLOWED — SAYING THEY ARE FACTS IS NOT
 Everything you write outside a restated fact is your recommendation, and the
 document renders it that way. So:
 - positioning_summary may argue for a framing, built from FACTS.
-- strengths_to_leverage may select and sharpen, but each entry must trace to FACTS.
+- Every confirmed strength is listed in the document for you, in full. You do not
+  author that list; any strength you name elsewhere must be one of them.
 - skill_priorities may rank the gaps that were collected.
 - search_targets may suggest industries or company types that fit the stated
   preferences — as suggestions, not as places the user said they wanted.

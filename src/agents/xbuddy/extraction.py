@@ -15,7 +15,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .enums import SectionID
-from .models import EXTRACT_MODELS, XBuddyData
+from .models import EXTRACT_MODELS, OPEN_TO_ANY_INDUSTRY, XBuddyData
 
 
 def get_extract_model(section_id: SectionID | str) -> type[BaseModel]:
@@ -49,6 +49,22 @@ def _is_no_op(value: Any) -> bool:
     return value is None or value == []
 
 
+def _canonical_industries(values: list[str]) -> list[str]:
+    """Store the open-industry answer under one spelling, once.
+
+    Only an entry that *is* the canonical value, ignoring case and spacing, is
+    rewritten; every named sector passes through untouched. Downstream readers can
+    then compare against `OPEN_TO_ANY_INDUSTRY` exactly.
+    """
+    result: list[str] = []
+    for value in values:
+        if " ".join(str(value).split()).casefold() == OPEN_TO_ANY_INDUSTRY:
+            value = OPEN_TO_ANY_INDUSTRY
+        if value not in result:
+            result.append(value)
+    return result
+
+
 def merge_extraction(extracted: BaseModel, user_data: XBuddyData) -> XBuddyData:
     """Apply an extraction result to `user_data`, returning a new instance.
 
@@ -76,6 +92,8 @@ def merge_extraction(extracted: BaseModel, user_data: XBuddyData) -> XBuddyData:
         value = getattr(extracted, field_name, None)
         if _is_no_op(value):
             continue
+        if field_name == "target_industries" and isinstance(value, list):
+            value = _canonical_industries(value)
         updates[field_name] = value
 
     if not updates:

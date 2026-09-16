@@ -354,3 +354,42 @@ def test_merged_data_still_round_trips():
         XBuddyData(target_roles=["SRE"]),
     )
     assert XBuddyData.model_validate(merged.model_dump()) == merged
+
+
+# --------------------------------------------------------------------------
+# "Open to any industry" is an answer, not an absence (production regression)
+# --------------------------------------------------------------------------
+
+from agents.xbuddy.models import OPEN_TO_ANY_INDUSTRY
+
+
+def test_the_schema_tells_extraction_how_to_record_an_open_industry_answer():
+    """Job Preferences says to record "no preference". The schema is where the
+    extraction model learns the value for it — before this, nothing representable
+    existed, and an explicit answer was stored as [] and reported as never discussed."""
+    description = JobPreferencesExtract.model_json_schema()["properties"]["target_industries"]["description"]
+    assert f'["{OPEN_TO_ANY_INDUSTRY}"]' in description
+    assert "Never name a sector the user did not name." in description
+
+
+def test_an_open_industry_answer_is_stored_as_a_value():
+    """What "I'm open to different industries as long as the role involves meaningful
+    AI engineering work" becomes once extracted: a non-empty, recorded preference."""
+    extracted = JobPreferencesExtract(**{**nulls_for(JobPreferencesExtract),
+                                         "target_industries": [OPEN_TO_ANY_INDUSTRY]})
+    merged = merge_extraction(extracted, XBuddyData())
+    assert merged.target_industries == [OPEN_TO_ANY_INDUSTRY]
+
+
+@pytest.mark.parametrize("spelling", ["Open to any industry", "  OPEN TO ANY   INDUSTRY ", "open to any industry"])
+def test_the_open_industry_answer_has_one_stored_spelling(spelling):
+    extracted = JobPreferencesExtract(**{**nulls_for(JobPreferencesExtract),
+                                         "target_industries": [spelling, "open to any industry"]})
+    assert merge_extraction(extracted, XBuddyData()).target_industries == [OPEN_TO_ANY_INDUSTRY]
+
+
+def test_named_sectors_pass_through_untouched():
+    """Normalization is exact: it never rewrites, merges, or drops a named sector."""
+    sectors = ["Fintech", "healthcare", "open to most industries"]
+    extracted = JobPreferencesExtract(**{**nulls_for(JobPreferencesExtract), "target_industries": sectors})
+    assert merge_extraction(extracted, XBuddyData()).target_industries == sectors
