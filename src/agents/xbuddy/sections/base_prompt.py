@@ -158,6 +158,19 @@ If nothing new was said about this section, return null for every field. That
 is a valid and common result.
 """
 
+# Appended to EXTRACTION_RULES when a candidate Action Plan awaits the user's
+# answer. The window is the user's reply alone: a plan they did not write cannot
+# be read back out of the assistant's own message and mistaken for a revision.
+ACTION_PLAN_REVISION_RULES = """HOW TO READ THE USER'S REPLY
+The user was shown the candidate plan above. The message below is their reply.
+- If the reply changes the plan in any way — rewrites, adds, removes, reorders,
+  or adjusts a step — return action_items as the complete plan as it now stands,
+  one step per item, in order. Use the user's own wording for every step they
+  wrote, and the candidate's wording for any step they kept unchanged.
+- If the reply accepts the plan without changing it, or says nothing about its
+  steps, return null.
+"""
+
 # System prompt for the final-output synthesis model. Machine-facing: the output is
 # structured JSON, the call is tagged so the service suppresses its tokens, and the
 # document the user sees is rendered deterministically from the result.

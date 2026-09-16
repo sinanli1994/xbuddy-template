@@ -522,7 +522,9 @@ async def test_confirm_proposal_through_real_service_synthesis_and_disk_restore(
             assert values["final_output"].startswith(f"# {expected_title}\n")
         assert model_call.await_count == 1
         assert j.generic.await_count == 0
-        assert [m.__name__ for m in j.extraction_models] == ["SkillAssessmentExtract"]
+        # The confirmation turn reads the reply for revisions before accepting it;
+        # it found none, so the proposal above was promoted verbatim.
+        assert [m.__name__ for m in j.extraction_models] == ["SkillAssessmentExtract", "ActionPlanExtract"]
 
 
 @pytest.mark.asyncio
@@ -540,3 +542,281 @@ async def test_pending_proposal_requires_current_message_and_actual_consent(jour
     assert result["user_data"].action_items == []
     assert result["final_output"] is None
     assert not result["should_generate_final_output"]
+
+
+# --------------------------------------------------------------------------
+# A revision must be confirmed on its own turn (production regression)
+# --------------------------------------------------------------------------
+
+# The shape of the production reply: it opens like an acceptance and then rewrites
+# every step. The decision model called it satisfied, and the original proposal was
+# committed in its place.
+REVISION_MESSAGE = (
+    "This is a good starting point. I'd make a few adjustments to make it more practical: "
+    "1. Tailor my resume for each relevant AI engineering role, and only write a cover letter "
+    "when it is useful or required. 2. Practice data structures and algorithms on weekdays, "
+    "aiming for about one problem per day. 3. Study AI system design in 1-2 focused sessions "
+    "each week. 4. Spend 1-2 sessions per week on systematic evaluation for LLM and RAG systems. "
+    "5. Apply consistently to targeted AI Engineer roles rather than applying broadly. "
+    "6. Do some focused networking each week, prioritizing meaningful conversations over a "
+    "fixed number of contacts. These are realistic for me."
+)
+REVISED = [
+    "Tailor my resume for each relevant AI engineering role, and only write a cover letter when it is useful or required.",
+    "Practice data structures and algorithms on weekdays, aiming for about one problem per day.",
+    "Study AI system design in 1-2 focused sessions each week.",
+    "Spend 1-2 sessions per week on systematic evaluation for LLM and RAG systems.",
+    "Apply consistently to targeted AI Engineer roles rather than applying broadly.",
+    "Do some focused networking each week, prioritizing meaningful conversations over a fixed number of contacts.",
+]
+
+
+@pytest.fixture
+def synthesis_spy(monkeypatch):
+    """Final synthesis, observable: whether it ran, and on which agreed plan."""
+    from agents.xbuddy.models import ActionItem, FinalOutput
+    from agents.xbuddy.nodes import implementation
+
+    async def synthesize(data):
+        return FinalOutput(
+            headline="Your job search strategy", positioning_summary="Uses what was collected.",
+            strengths_to_leverage=data.strengths, skill_priorities=data.skill_gaps,
+            search_targets=data.preferred_locations,
+            action_items=[ActionItem(step=step, rationale="Agreed in Section 5.", priority=i, timeframe=None)
+                          for i, step in enumerate(data.action_items, 1)],
+            risks_or_constraints=[], unknowns=[],
+        ), None
+
+    spy = AsyncMock(side_effect=synthesize)
+    monkeypatch.setattr(implementation, "synthesize_final_output", spy)
+    return spy
+
+
+def satisfied(make_decision, action=DecisionAction.STAY):
+    """The production decision: satisfied, whatever the reply actually did."""
+    return {"parsed": make_decision(
+        action=action, presented_summary=True, is_satisfied=True,
+        decision_reason="User confirmed the summary and provided adjustments to the action plan.",
+    ), "parsing_error": None}
+
+
+async def reply(j, text, steps=()):
+    """One user turn. `steps` is what Section 5 extraction reads out of the reply."""
+    j.data = j.data.model_copy(update={"action_items": list(steps)})
+    return await j.graph.ainvoke({"messages": [HumanMessage(content=text)]}, j.config)
+
+
+async def revise(j, make_decision, steps=REVISED):
+    j.decision.return_value = satisfied(make_decision)
+    return await reply(j, REVISION_MESSAGE, steps)
+
+
+def assert_revision_pending(j, result, proposal, synthesis_spy, steps=REVISED):
+    from agents.xbuddy.action_plan import REVISED_PLAN_QUESTION, render_revised_plan
+
+    pending = result["pending_action_plan"]
+    assert pending is not None, "a revision must stay pending, not be promoted or dropped"
+    assert pending.action_items == steps, "the user's revision is the candidate now"
+    assert pending.message_id != proposal.message_id
+    assert result["user_data"].action_items == [], "a revision is not a confirmation"
+    assert result["user_data"].action_items != proposal.action_items
+    assert result["current_section"] is SectionID.ACTION_PLAN
+    assert result["section_states"]["action_plan"].status is SectionStatus.IN_PROGRESS
+    assert result["should_generate_final_output"] is False
+    assert result["finished"] is False
+    assert result["final_output"] is None
+    assert synthesis_spy.await_count == 0
+    # Shown back once, verbatim, on the message that alone can confirm it.
+    shown = result["messages"][-1]
+    assert isinstance(shown, AIMessage) and shown.id == pending.message_id
+    assert shown.content == render_revised_plan(steps)
+    assert shown.content.endswith(REVISED_PLAN_QUESTION)
+    assert result["awaiting_satisfaction_feedback"] is True
+    assert j.generic.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_revised_proposal_is_held_pending_and_nothing_is_confirmed(journey, make_decision, synthesis_spy):
+    """The exact production failure: six rewritten steps + is_satisfied=true, action=stay."""
+    proposed = await confirm(journey)
+    assert_proposal(journey, proposed)  # proposal generation itself is unchanged
+    proposal = proposed["pending_action_plan"]
+
+    result = await revise(journey, make_decision)
+
+    assert_revision_pending(journey, result, proposal, synthesis_spy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["revision_never_read", "satisfaction_accepts_anything"])
+async def test_the_revision_regression_has_teeth(journey, make_decision, synthesis_spy, monkeypatch, mutation):
+    """Both ways back to the production bug are caught by the assertions above."""
+    from agents.xbuddy.nodes import memory_updater
+
+    if mutation == "revision_never_read":
+        monkeypatch.setattr(memory_updater, "_pending_plan", lambda state, packet: None)
+    else:
+        monkeypatch.setattr(memory_updater, "_same_plan", lambda steps, candidate: True)
+    proposal = (await confirm(journey))["pending_action_plan"]
+
+    result = await revise(journey, make_decision)
+
+    with pytest.raises(AssertionError):
+        assert_revision_pending(journey, result, proposal, synthesis_spy)
+
+
+@pytest.mark.asyncio
+async def test_a_bare_acceptance_still_promotes_the_proposal_verbatim(journey, synthesis_spy):
+    proposal = (await confirm(journey))["pending_action_plan"]
+
+    result = await reply(journey, "yes, looks good")  # extraction finds no steps
+
+    assert result["user_data"].action_items == proposal.action_items == [a.action for a in journey.actions]
+    assert result["pending_action_plan"] is None
+    assert result["section_states"]["action_plan"].status is SectionStatus.DONE
+    assert result["should_generate_final_output"] is True
+    assert synthesis_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation_action", [DecisionAction.STAY, DecisionAction.NEXT])
+async def test_confirming_a_revision_commits_exactly_the_revised_plan(
+    journey, make_decision, synthesis_spy, confirmation_action,
+):
+    proposal = (await confirm(journey))["pending_action_plan"]
+    revised = await revise(journey, make_decision)
+    # Before confirmation: no synthesis, and nothing that would trigger it.
+    assert revised["should_generate_final_output"] is False
+    assert synthesis_spy.await_count == 0
+
+    journey.decision.return_value = satisfied(make_decision, confirmation_action)
+    result = await reply(journey, "Yes, that's right.")
+
+    assert result["user_data"].action_items == REVISED
+    assert not set(proposal.action_items) & set(result["user_data"].action_items)
+    assert result["pending_action_plan"] is None
+    assert result["section_states"]["action_plan"].status is SectionStatus.DONE
+    assert result["should_generate_final_output"] is True
+    assert synthesis_spy.await_count == 1
+    assert synthesis_spy.await_args.args[0].action_items == REVISED
+    assert all(step in result["final_output"] for step in REVISED)
+    assert not any(step in result["final_output"] for step in proposal.action_items)
+
+
+@pytest.mark.asyncio
+async def test_a_second_revision_replaces_the_first_and_still_needs_confirming(
+    journey, make_decision, synthesis_spy,
+):
+    proposal = (await confirm(journey))["pending_action_plan"]
+    first = (await revise(journey, make_decision))["pending_action_plan"]
+    again = REVISED[:3] + ["Ask two former colleagues for referrals this month."]
+
+    result = await revise(journey, make_decision, steps=again)
+
+    assert_revision_pending(journey, result, proposal, synthesis_spy, steps=again)
+    assert result["pending_action_plan"].message_id != first.message_id
+
+
+@pytest.mark.asyncio
+async def test_the_revision_is_read_from_the_reply_alone_even_when_satisfied(journey, make_decision, monkeypatch):
+    """Extraction runs on a satisfied revision turn, and cannot read the plan back
+    out of the assistant's own message: the reply is the only message it sees."""
+    from agents.xbuddy.nodes import memory_updater
+
+    proposal = (await confirm(journey))["pending_action_plan"]
+    harness = memory_updater._extraction_chain
+    seen = []
+
+    def recording(model):
+        chain = harness(model)
+
+        async def ainvoke(messages, config=None):
+            seen.append((model.__name__, list(messages)))
+            return await chain.ainvoke(messages, config)
+
+        return SimpleNamespace(ainvoke=ainvoke)
+
+    monkeypatch.setattr(memory_updater, "_extraction_chain", recording)
+    await revise(journey, make_decision)
+
+    [(schema, messages)] = seen
+    assert schema == "ActionPlanExtract"
+    system, *window = messages
+    assert [message.content for message in window] == [REVISION_MESSAGE]
+    assert "CANDIDATE PLAN AWAITING CONFIRMATION" in system.content
+    for index, step in enumerate(proposal.action_items, 1):
+        assert f"{index}. {step}" in system.content
+    assert "First-Draft Action Plan" not in system.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("satisfaction", [False, None])
+async def test_a_reply_that_changes_nothing_leaves_the_pending_plan_alone(journey, make_decision, satisfaction):
+    proposal = (await confirm(journey))["pending_action_plan"]
+    journey.decision.return_value = {"parsed": make_decision(
+        action=DecisionAction.STAY, presented_summary=True, is_satisfied=satisfaction,
+    ), "parsing_error": None}
+
+    result = await reply(journey, "ok, thanks")
+
+    assert result["pending_action_plan"] == proposal
+    assert result["user_data"].action_items == []
+    assert result["section_states"]["action_plan"].status is SectionStatus.IN_PROGRESS
+    assert not result["should_generate_final_output"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("echo", ["verbatim", "cosmetic"])
+async def test_reading_the_candidate_back_is_acceptance_not_revision(journey, synthesis_spy, echo):
+    """A "yes" from which extraction returns the plan itself changes nothing."""
+    proposal = (await confirm(journey))["pending_action_plan"]
+    steps = proposal.action_items if echo == "verbatim" else [
+        "  " + step.upper().replace(" ", "  ") for step in proposal.action_items
+    ]
+
+    result = await reply(journey, "yes", steps)
+
+    assert result["user_data"].action_items == proposal.action_items  # the stored text, not the echo
+    assert result["pending_action_plan"] is None
+    assert result["section_states"]["action_plan"].status is SectionStatus.DONE
+    assert synthesis_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_reply_to_a_pending_plan_confirms_nothing(
+    journey, make_decision, synthesis_spy, monkeypatch,
+):
+    """Extraction down: whether the reply was a revision is unknown, so fail closed."""
+    from agents.xbuddy.nodes import memory_updater
+
+    proposal = (await confirm(journey))["pending_action_plan"]
+
+    def outage(model):
+        async def ainvoke(messages, config=None):
+            raise RuntimeError("extraction outage (test)")
+
+        return SimpleNamespace(ainvoke=ainvoke)
+
+    monkeypatch.setattr(memory_updater, "_extraction_chain", outage)
+    journey.decision.return_value = satisfied(make_decision)
+    result = await journey.graph.ainvoke({"messages": [HumanMessage(content=REVISION_MESSAGE)]}, journey.config)
+
+    assert result["user_data"].action_items == []
+    assert result["pending_action_plan"] == proposal
+    assert result["section_states"]["action_plan"].status is SectionStatus.IN_PROGRESS
+    assert not result["should_generate_final_output"]
+    assert synthesis_spy.await_count == 0
+    assert "action plan revision extraction error" in result["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_a_change_leaving_fewer_than_three_steps_confirms_nothing(journey, make_decision, synthesis_spy):
+    proposal = (await confirm(journey))["pending_action_plan"]
+
+    result = await revise(journey, make_decision, steps=REVISED[:2])
+
+    assert result["user_data"].action_items == []
+    assert result["pending_action_plan"] == proposal
+    assert result["section_states"]["action_plan"].status is SectionStatus.IN_PROGRESS
+    assert not result["should_generate_final_output"]
+    assert synthesis_spy.await_count == 0

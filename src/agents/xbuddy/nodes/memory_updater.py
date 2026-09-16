@@ -37,6 +37,7 @@ divergence observable rather than silent.
 
 import logging
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -46,7 +47,7 @@ from ..enums import SectionID, SectionStatus
 from ..extraction import extraction_changed, get_extract_model, merge_extraction
 from ..models import ContextPacket, PendingActionPlan, SectionState, XBuddyData, XBuddyState
 from ..persistence import mark_final_output_stale, persist_section
-from ..sections.base_prompt import EXTRACTION_RULES
+from ..sections.base_prompt import ACTION_PLAN_REVISION_RULES, EXTRACTION_RULES
 from ..state_factory import all_sections_complete, coerce_section_state
 from .process_confirmation import confirmation_processed
 
@@ -62,6 +63,10 @@ INTERNAL_EXTRACTION_TAG = "internal_extraction"
 FINAL_OUTPUT_PENDING_STALE = "stale"
 
 EXTRACTION_WINDOW_SIZE = 10
+
+# Section 5's floor, shared by PendingActionPlan and the validation rule: fewer
+# agreed steps than this is not a plan.
+MIN_AGREED_STEPS = 3
 
 
 def _extraction_chain(extract_model: type[BaseModel]):
@@ -335,6 +340,119 @@ async def _extract(
     return after, None
 
 
+def _pending_plan(state: XBuddyState, packet: ContextPacket) -> PendingActionPlan | None:
+    """The candidate plan this turn is an answer to, or None.
+
+    Only a processed Action Plan turn answers one — the same section and processing
+    gate `_accepted_proposal` applies — so every other turn keeps its existing path.
+    """
+    if packet.section_id is not SectionID.ACTION_PLAN or not confirmation_processed(state):
+        return None
+    pending = state.get("pending_action_plan")
+    if pending is None:
+        return None
+    try:
+        return PendingActionPlan.model_validate(pending)
+    except ValueError:
+        return None
+
+
+def _revision_prompt(
+    packet: ContextPacket, pending: PendingActionPlan, messages: list[BaseMessage]
+) -> list[BaseMessage]:
+    """The candidate as labelled reference, and the user's reply as the only message.
+
+    The window is deliberately not `_extraction_window`. That one includes the
+    assistant message presenting the plan, and a model shown a plan plus "yes" reads
+    the plan back as the user's answer. With the reply alone, a bare acceptance has
+    no steps in it to extract.
+    """
+    plan = "\n".join(f"{index}. {step}" for index, step in enumerate(pending.action_items, 1))
+    context = (
+        f"CURRENT SECTION: {packet.section_id.value}\n\n"
+        f"CANDIDATE PLAN AWAITING CONFIRMATION\n{plan}\n\n"
+        f"{ACTION_PLAN_REVISION_RULES.strip()}"
+    )
+    reply = [message for message in messages if isinstance(message, HumanMessage)][-1:]
+    return [SystemMessage(content=f"{EXTRACTION_RULES.strip()}\n\n{context}"), *reply]
+
+
+async def _extract_plan_revision(
+    packet: ContextPacket,
+    pending: PendingActionPlan,
+    messages: list[BaseMessage],
+    config: RunnableConfig,
+) -> tuple[list[str] | None, str | None]:
+    """What the user's reply says the plan now is. Returns (steps, error); never raises.
+
+    The existing extraction chain and Section 5 schema, run on every answer to a
+    pending plan whatever the decision model concluded. In production that model
+    returned `is_satisfied: true` for a reply rewriting all six steps, and
+    satisfaction alone promoted the original proposal over the user's own plan.
+
+    `steps` empty means the reply said nothing about the steps. Whether non-empty
+    steps are a revision is the caller's decision.
+    """
+    try:
+        extract_model = get_extract_model(packet.section_id)
+    except ValueError as exc:
+        return None, f"no extraction schema: {exc}"
+
+    try:
+        result = await _extraction_chain(extract_model).ainvoke(
+            _revision_prompt(packet, pending, messages), config
+        )
+    except Exception as exc:  # a failed extraction must not kill the turn
+        logger.exception("memory_updater: action plan revision extraction failed")
+        return None, f"action plan revision extraction error: {exc}"
+
+    parsing_error = result.get("parsing_error") if isinstance(result, dict) else None
+    extracted = result.get("parsed") if isinstance(result, dict) else None
+    if parsing_error is not None or not isinstance(extracted, extract_model):
+        return None, f"unparseable action plan revision: {parsing_error}"
+
+    steps = getattr(extracted, "action_items", None) or []
+    return [step.strip() for step in steps if step and step.strip()], None
+
+
+def _same_plan(steps: list[str], candidate: list[str]) -> bool:
+    """Whether extraction only read the candidate back.
+
+    Case, spacing and a trailing full stop are not revisions. Anything else —
+    rewording, reordering, a step added or dropped — is.
+    """
+    def normalized(step: str) -> str:
+        return " ".join(step.split()).casefold().rstrip(".")
+
+    return [normalized(step) for step in steps] == [normalized(step) for step in candidate]
+
+
+def _action_plan_held_open(state: XBuddyState, *, awaiting: bool) -> dict[str, Any]:
+    """Progress that keeps Action Plan collecting: not done, nothing finalized.
+
+    `awaiting` says whether the next reply is an answer to a plan the user is being
+    shown. `generate_decision` writes that flag earlier in the turn from the model's
+    view of satisfaction, so a revision has to reopen it here.
+    """
+    still_open = {
+        key: coerce_section_state(value)
+        for key, value in (state.get("section_states") or {}).items()
+    }
+    active_plan = still_open.get(SectionID.ACTION_PLAN.value) or SectionState(
+        section_id=SectionID.ACTION_PLAN,
+    )
+    still_open[SectionID.ACTION_PLAN.value] = active_plan.model_copy(
+        update={"status": SectionStatus.IN_PROGRESS}
+    )
+    return {
+        "section_states": still_open,
+        "should_generate_final_output": False,
+        "finished": False,
+        "router_directive": "stay",
+        "awaiting_satisfaction_feedback": awaiting,
+    }
+
+
 def _dedupe(values: list[str]) -> list[str]:
     """Order-preserving unique.
 
@@ -475,13 +593,41 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     # Nothing said yet means nothing to extract. Not a failure — a turn with no
     # new facts, which still gets its progress and persistence applied.
     merged: XBuddyData | None = None
-    accepted = _accepted_proposal(state, packet, messages)
-    if accepted is not None:
-        # Do not ask another LLM to reconstruct the very steps just confirmed.
-        # Their text/order came from the validated, checkpointed proposal.
-        candidate = before.model_copy(update={"action_items": accepted}, deep=True)
-        merged = candidate if extraction_changed(before, candidate) else None
-        logger.info("memory_updater: confirmed stored Action Plan (%d steps)", len(accepted))
+    accepted: list[str] | None = None
+    revised: list[str] | None = None
+    # The reply answered a pending plan but could not be read safely — extraction
+    # failed, or it changed steps without leaving a whole plan. Nothing is confirmed.
+    unresolved = False
+
+    pending = _pending_plan(state, packet)
+    if pending is not None:
+        # An answer to a pending plan has its own path. The general extraction below
+        # merges straight into agreed action_items, so it never runs on one.
+        steps, revision_error = await _extract_plan_revision(packet, pending, messages, config)
+        if revision_error is not None:
+            errors.append(revision_error)
+            unresolved = True
+        elif steps and not _same_plan(steps, pending.action_items):
+            if len(steps) >= MIN_AGREED_STEPS:
+                revised = steps
+                logger.info(
+                    "memory_updater: Action Plan revised (%d steps); awaiting confirmation",
+                    len(steps),
+                )
+            else:
+                logger.info(
+                    "memory_updater: reply changed the plan but left %d steps; nothing confirmed",
+                    len(steps),
+                )
+                unresolved = True
+        else:
+            # Only a reply that leaves the plan as it was can accept it verbatim.
+            accepted = _accepted_proposal(state, packet, messages)
+
+        if accepted is not None:
+            candidate = before.model_copy(update={"action_items": accepted}, deep=True)
+            merged = candidate if extraction_changed(before, candidate) else None
+            logger.info("memory_updater: confirmed stored Action Plan (%d steps)", len(accepted))
     elif _extraction_window(messages):
         merged, extraction_error = await _extract(packet, before, messages, config)
         if extraction_error is not None:
@@ -491,33 +637,22 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
 
     effective_data = merged if merged is not None else before
     decision_output = state.get("agent_output")
-    # A pre-reply Action Plan confirmation cannot close collection without its
-    # agreed steps. In that case there is no earlier reply to explain a failed
-    # finalization, so keep this section open and let the router reply normally.
-    if (
+    if revised is not None or unresolved:
+        # A revision cannot also be its own confirmation: the user has not seen the
+        # revised plan yet. Hold the section open, with the handshake open, so the
+        # next reply is processed as the answer to what they are about to be shown.
+        progress = _action_plan_held_open(state, awaiting=True)
+    elif (
+        # A pre-reply Action Plan confirmation cannot close collection without its
+        # agreed steps. In that case there is no earlier reply to explain a failed
+        # finalization, so keep this section open and let the router reply normally.
         packet.section_id is SectionID.ACTION_PLAN
         and confirmation_processed(state)
         and decision_output is not None
         and decision_output.is_satisfied is True
-        and len(effective_data.action_items) < 3
+        and len(effective_data.action_items) < MIN_AGREED_STEPS
     ):
-        still_open = {
-            key: coerce_section_state(value)
-            for key, value in (state.get("section_states") or {}).items()
-        }
-        active_plan = still_open.get(SectionID.ACTION_PLAN.value) or SectionState(
-            section_id=SectionID.ACTION_PLAN,
-        )
-        still_open[SectionID.ACTION_PLAN.value] = active_plan.model_copy(
-            update={"status": SectionStatus.IN_PROGRESS}
-        )
-        progress = {
-            "section_states": still_open,
-            "should_generate_final_output": False,
-            "finished": False,
-            "router_directive": "stay",
-            "awaiting_satisfaction_feedback": False,
-        }
+        progress = _action_plan_held_open(state, awaiting=False)
         errors.append("Action Plan confirmation needs at least three stored agreed steps")
     sections = progress.get("section_states") or {
         key: coerce_section_state(value)
@@ -566,6 +701,12 @@ async def memory_updater_node(state: XBuddyState, config: RunnableConfig) -> XBu
     update = _with_progress(progress, persistence_update)
     if accepted is not None:
         update["pending_action_plan"] = None
+    if revised is not None:
+        # A fresh id, bound when generate_reply presents it: the message that showed
+        # the old plan can no longer confirm anything.
+        update["pending_action_plan"] = PendingActionPlan(
+            message_id=str(uuid4()), action_items=revised
+        )
     # Applied last: on a reopening turn the lifecycle fragment must win over the
     # progress half, which computed `section_states` and the completion flag before
     # extraction revealed that the source data had moved.
