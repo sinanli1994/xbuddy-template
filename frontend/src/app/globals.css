@@ -40,3 +40,76 @@ body {
     text-wrap: balance;
   }
 }
+
+/* ------------------------------------------------------ responsive layout ----
+   The sidebar is one element at every width. On desktop and tablet it is the
+   column it has always been. Below 768px it becomes an off-canvas drawer over a
+   full-width chat, opened from a menu button, so a phone is never left with a chat
+   ~60px wide beside a sidebar that refuses to shrink.
+
+   Width lives here rather than inline: an inline style cannot be overridden by a
+   media query. Everything else about the sidebar stays inline in page.tsx. */
+
+.jb-sidebar {
+  width: 32%;
+  min-width: 280px;
+  max-width: 400px;
+}
+
+/* Mobile-only controls. Never displayed on desktop. */
+.jb-menu-button,
+.jb-drawer-close,
+.jb-backdrop {
+  display: none;
+}
+
+@media (max-width: 767.98px) {
+  .jb-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 50;
+    width: min(85vw, 360px);
+    min-width: 0;
+    max-width: none;
+    box-shadow: 4px 0 24px rgba(15, 23, 42, 0.18);
+    transform: translateX(-100%);
+    /* Hidden, not only moved: a closed drawer's controls must not be reachable by
+       Tab or a screen reader. visibility waits for the slide-out to finish. */
+    visibility: hidden;
+    transition: transform 200ms ease, visibility 0s linear 200ms;
+  }
+
+  .jb-sidebar[data-open="true"] {
+    transform: none;
+    visibility: visible;
+    transition: transform 200ms ease;
+  }
+
+  .jb-backdrop[data-open="true"] {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(15, 23, 42, 0.45);
+  }
+
+  .jb-menu-button {
+    display: inline-flex;
+  }
+
+  .jb-drawer-close {
+    display: inline-flex;
+    position: absolute;
+    top: 14px;
+    right: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jb-sidebar,
+  .jb-sidebar[data-open="true"] {
+    transition: none;
+  }
+}

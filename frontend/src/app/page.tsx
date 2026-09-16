@@ -68,6 +68,11 @@ export default function JobBuddyDemo() {
   // Tagged with its thread and shown only while that thread is selected, so one
   // conversation's resume can never appear in another. Memory only, like the plan.
   const [resume, setResume] = useState<ThreadResume | null>(null);
+  // The sidebar drawer on small screens. Desktop ignores it: there the sidebar is
+  // always a column, and the controls that change this are hidden by CSS.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const drawerCloseRef = useRef<HTMLButtonElement>(null);
+  const focusBeforeMenu = useRef<HTMLElement | null>(null);
   // Invalidate reads/events from a selection that was deleted or switched away.
   const selectionVersion = useRef(0);
   const selectionAtRender = selectionVersion.current;
@@ -262,6 +267,31 @@ export default function JobBuddyDemo() {
     return () => { selectionVersion.current += 1; };
   }, [restore]);
 
+  const openMenu = useCallback((event?: { currentTarget: EventTarget | null }) => {
+    // Return focus to the button that opened the drawer, not to whatever happened to
+    // be focused: a tap does not focus a button in iOS Safari, so that would often be
+    // the chat input — and focusing it on close would pop up the keyboard.
+    const opener = event?.currentTarget;
+    focusBeforeMenu.current = opener instanceof HTMLElement ? opener : null;
+    setMenuOpen(true);
+  }, []);
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+
+  // While the drawer is open: focus starts inside it, Escape closes it, and closing
+  // returns focus to whatever opened it.
+  useEffect(() => {
+    if (!menuOpen) return;
+    drawerCloseRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuOpen(false);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      focusBeforeMenu.current?.focus();
+    };
+  }, [menuOpen]);
+
   /** Adopt a thread locally. No network call — the caller decides whether to restore. */
   const selectLocally = (id: DemoIdentity | null) => {
     selectionVersion.current += 1;
@@ -286,6 +316,7 @@ export default function JobBuddyDemo() {
     const id = mintIdentity();
     rememberConversation(id.threadId, id.userId);
     selectLocally(id);
+    setMenuOpen(false); // on a phone, go straight to the new conversation
     // A freshly minted thread cannot have a resume yet, so there is nothing to ask.
     setResume({ threadId: id.threadId, view: { kind: 'none' } });
     setRestoreState('ready');
@@ -371,6 +402,7 @@ export default function JobBuddyDemo() {
   }, [identity]);
 
   const handleSelectConversation = (conversation: DemoConversation) => {
+    setMenuOpen(false); // on a phone, show the chosen conversation
     if (conversation.threadId === identity?.threadId) return;
     selectLocally({ threadId: conversation.threadId, userId: conversation.userId });
     // The same restoration path a refresh takes: history + completion, no model call.
@@ -413,11 +445,20 @@ export default function JobBuddyDemo() {
         backgroundColor: '#ffffff',
       }}
     >
+      {/* Below 768px the sidebar is a drawer; this dims and blocks the chat behind it. */}
+      <div
+        className="jb-backdrop"
+        data-open={menuOpen ? 'true' : 'false'}
+        aria-hidden="true"
+        onClick={closeMenu}
+      />
+
       <aside
+        id="jobbuddy-sidebar"
+        className="jb-sidebar"
+        data-open={menuOpen ? 'true' : 'false'}
+        aria-label="Progress, resume and conversations"
         style={{
-          width: '32%',
-          minWidth: 280,
-          maxWidth: 400,
           height: '100%',
           padding: 20,
           backgroundColor: '#f8fafc',
@@ -432,6 +473,29 @@ export default function JobBuddyDemo() {
           minHeight: 0,
         }}
       >
+        {/* Drawer close, shown only below 768px by globals.css. */}
+        <button
+          ref={drawerCloseRef}
+          type="button"
+          className="jb-drawer-close"
+          onClick={closeMenu}
+          aria-label="Close menu"
+          style={{
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 36,
+            height: 36,
+            fontSize: 18,
+            color: '#475569',
+            backgroundColor: '#ffffff',
+            border: '1px solid #e2e8f0',
+            borderRadius: 8,
+            cursor: 'pointer',
+          }}
+        >
+          <span aria-hidden>✕</span>
+        </button>
+
         <JobBuddyProgress
           completion={completion}
           threadId={identity?.threadId ?? null}
@@ -442,7 +506,10 @@ export default function JobBuddyDemo() {
           onDeleteConversation={handleDeleteConversation}
           finalPlanReady={Boolean(finalPlan)}
           finalPlanError={planError}
-          onViewFinalPlan={() => setPlanOpen(true)}
+          onViewFinalPlan={() => {
+            setMenuOpen(false);
+            setPlanOpen(true);
+          }}
           onRetryFinalPlan={() => identity && void loadFinalPlan(identity)}
           resume={resumeForThread(resume, identity?.threadId ?? null)}
           onUploadResume={(file) => void handleUploadResume(file)}
@@ -513,6 +580,8 @@ export default function JobBuddyDemo() {
             onUploadResume={(file) => void handleUploadResume(file)}
             onRejectResume={handleRejectResume}
             onRetryResumeStatus={() => identity && void loadResumeStatus(identity)}
+            onOpenMenu={openMenu}
+            menuOpen={menuOpen}
             onCompletionUpdate={(next) => {
               if (selectionAtRender !== selectionVersion.current) return;
               setCompletion(next);
@@ -528,12 +597,40 @@ export default function JobBuddyDemo() {
             style={{
               flex: 1,
               display: 'flex',
+              flexDirection: 'column',
+              gap: 12,
               alignItems: 'center',
               justifyContent: 'center',
+              padding: 24,
+              textAlign: 'center',
               color: '#94a3b8',
               fontSize: 14,
             }}
           >
+            {/* With no conversation there is no chat header, so the drawer needs its
+                own way in on a phone. Hidden by globals.css at desktop widths. */}
+            <button
+              type="button"
+              className="jb-menu-button"
+              onClick={openMenu}
+              aria-label="Open menu: progress, resume and conversations"
+              aria-controls="jobbuddy-sidebar"
+              aria-expanded={menuOpen}
+              style={{
+                alignItems: 'center',
+                gap: 8,
+                padding: '8px 14px',
+                fontSize: 14,
+                fontWeight: 600,
+                color: '#4f46e5',
+                backgroundColor: '#ffffff',
+                border: '1px solid #c7d2fe',
+                borderRadius: 8,
+                cursor: 'pointer',
+              }}
+            >
+              <span aria-hidden>☰</span> Menu
+            </button>
             {restoreState === 'loading'
               ? 'Loading your conversation…'
               : 'Choose “Start a new conversation” in the sidebar to begin.'}

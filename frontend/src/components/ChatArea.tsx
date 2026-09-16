@@ -55,6 +55,12 @@ interface ChatAreaProps {
   onUploadResume?: (file: File) => void;
   onRejectResume?: (message: string) => void;
   onRetryResumeStatus?: () => void;
+  /**
+   * Opens the sidebar drawer on small screens. The button it renders is hidden by
+   * CSS at desktop widths, where the sidebar is always shown.
+   */
+  onOpenMenu?: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  menuOpen?: boolean;
 }
 
 export default function ChatArea({
@@ -72,6 +78,8 @@ export default function ChatArea({
   onUploadResume,
   onRejectResume,
   onRetryResumeStatus,
+  onOpenMenu,
+  menuOpen = false,
 }: ChatAreaProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -451,7 +459,33 @@ export default function ChatArea({
         alignItems: 'center',
         gap: '16px'
       }}>
-         <div style={{ flex: 1 }}>
+         {onOpenMenu && (
+           // No inline display: globals.css shows this only below 768px.
+           <button
+             type="button"
+             className="jb-menu-button"
+             onClick={onOpenMenu}
+             aria-label="Open menu: progress, resume and conversations"
+             aria-controls="jobbuddy-sidebar"
+             aria-expanded={menuOpen}
+             style={{
+               alignItems: 'center',
+               justifyContent: 'center',
+               width: 40,
+               height: 40,
+               flexShrink: 0,
+               fontSize: 20,
+               color: '#334155',
+               backgroundColor: '#ffffff',
+               border: '1px solid #e2e8f0',
+               borderRadius: 8,
+               cursor: 'pointer',
+             }}
+           >
+             <span aria-hidden>☰</span>
+           </button>
+         )}
+         <div style={{ flex: 1, minWidth: 0 }}>
            <h1 style={{
              fontSize: '20px',
              fontWeight: 'bold',
