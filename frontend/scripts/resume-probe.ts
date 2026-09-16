@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   RESUME_MAX_BYTES,
   checkResumeFile,
+  chooseResumeFile,
   currentResume,
   errorMessageFrom,
   metaFromResponse,
@@ -62,6 +63,15 @@ check('a non-PDF, an empty file, and an oversized file are refused before any re
   assert.match(checkResumeFile({ name: 'cv.pdf', type: 'application/pdf', size: RESUME_MAX_BYTES + 1 }) ?? '', /2 MB/);
 });
 
+check('a drop or pick offers exactly one acceptable PDF', () => {
+  const pdf = { name: 'cv.pdf', type: 'application/pdf', size: 1000 };
+  assert.equal(chooseResumeFile([]), null);
+  assert.equal(chooseResumeFile(null), null);
+  assert.deepEqual(chooseResumeFile([pdf]), { file: pdf });
+  assert.match((chooseResumeFile([pdf, pdf]) as { refusal: string }).refusal, /one PDF/);
+  assert.match((chooseResumeFile([{ ...pdf, name: 'cv.png', type: 'image/png' }]) as { refusal: string }).refusal, /PDF/);
+  assert.match((chooseResumeFile([{ ...pdf, size: RESUME_MAX_BYTES + 1 }]) as { refusal: string }).refusal, /2 MB/);
+});
 check('metadata is read only from a complete response', () => {
   assert.deepEqual(
     metaFromResponse({ filename: 'cv.pdf', page_count: 2, chunk_count: 12, indexed_at: '2026-09-11T12:00:00Z' }),

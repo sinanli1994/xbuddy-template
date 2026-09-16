@@ -53,6 +53,22 @@ export function checkResumeFile(file: { name: string; type: string; size: number
   return null;
 }
 
+/**
+ * The one file a drop or the file picker may upload, or why not. Null when nothing
+ * was offered. Refusals are decided here, before any request; the page checks again
+ * before sending, and the backend's validation remains the authority.
+ */
+export function chooseResumeFile<F extends { name: string; type: string; size: number }>(
+  files: ArrayLike<F> | null | undefined,
+): { file: F } | { refusal: string } | null {
+  const count = files?.length ?? 0;
+  if (!files || count === 0) return null;
+  if (count > 1) return { refusal: 'Please add one PDF at a time.' };
+  const file = files[0];
+  const refusal = checkResumeFile(file);
+  return refusal ? { refusal } : { file };
+}
+
 /** Metadata from a proxy response; null when the response does not describe an indexed resume. */
 export function metaFromResponse(data: unknown): ResumeMeta | null {
   if (!data || typeof data !== 'object') return null;

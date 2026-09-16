@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import JobBuddyWelcome from '@/components/JobBuddyWelcome';
+import type { ResumeView } from '@/utils/resume';
 import ProgressiveText from '@/components/ProgressiveText';
 import {
   chatScrollBehavior,
@@ -49,6 +50,11 @@ interface ChatAreaProps {
   onSectionUpdate: (section: Section) => void;
   onCompletionUpdate?: (completion: CompletionState) => void;
   onFirstUserMessage?: (content: string) => void;
+  /** The page's resume view and handlers, passed through to the welcome card. */
+  resume?: ResumeView | null;
+  onUploadResume?: (file: File) => void;
+  onRejectResume?: (message: string) => void;
+  onRetryResumeStatus?: () => void;
 }
 
 export default function ChatArea({
@@ -62,6 +68,10 @@ export default function ChatArea({
   onSectionUpdate,
   onCompletionUpdate,
   onFirstUserMessage,
+  resume,
+  onUploadResume,
+  onRejectResume,
+  onRetryResumeStatus,
 }: ChatAreaProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -515,7 +525,12 @@ export default function ChatArea({
             </div>
           </div>
         ) : messages.length === 0 ? (
-          <JobBuddyWelcome />
+          <JobBuddyWelcome
+            resume={resume}
+            onUploadResume={onUploadResume}
+            onRejectResume={onRejectResume}
+            onRetryResumeStatus={onRetryResumeStatus}
+          />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {messages.map((message) => (
