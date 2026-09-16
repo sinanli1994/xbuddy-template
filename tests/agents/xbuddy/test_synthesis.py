@@ -520,3 +520,202 @@ async def test_a_successful_run_returns_a_complete_artifact(monkeypatch):
     assert isinstance(result, FinalOutput)
     assert [entry.step for entry in result.action_items] == CONFIRMED
     assert result.unknowns, "an incomplete XBuddyData must report unknowns"
+
+
+# --------------------------------------------------------------------------
+# G. Final Plan grounding (production regressions)
+# --------------------------------------------------------------------------
+
+from agents.xbuddy.context import render_known_data
+from agents.xbuddy.final_output import render_final_output
+from agents.xbuddy.models import OPEN_TO_ANY_INDUSTRY
+from agents.xbuddy.sections.base_prompt import SYNTHESIS_RULES
+from agents.xbuddy.synthesis import total_years_as_role_tenure
+
+# The authoritative production state behind the wrong Final Plan.
+PRODUCTION_STRENGTHS = [
+    "AI & Agent Engineering",
+    "Backend & Web Development",
+    "Data & Persistence",
+    "DevOps & Testing",
+    "Cross-functional collaboration",
+    "Debugging",
+    "Testing",
+    "Strong quality and reliability mindset",
+]
+# Word for word, what the synthesis model wrote in production.
+PRODUCTION_SUMMARY = (
+    "With 5 years of experience as an AI Engineer and a Master's degree in Computational "
+    "Science, this candidate is focused on building production AI applications involving "
+    "LLMs, RAG, and backend systems."
+)
+
+
+def production(**overrides) -> XBuddyData:
+    values = {
+        "target_roles": ["AI Engineer", "Generative AI Developer", "AI Solutions Engineer"],
+        "current_role": "AI Engineer at Branchy Solution",
+        "years_experience": 5,
+        "strengths": PRODUCTION_STRENGTHS,
+        "preferred_locations": ["GTA", "remote"],
+        "target_industries": [OPEN_TO_ANY_INDUSTRY],
+        "action_items": ["Ship a Kubernetes side project"],
+    }
+    values.update(overrides)
+    return XBuddyData(**values)
+
+
+# --- Issue 1: total experience is not role tenure ---------------------------
+
+
+def test_facts_label_the_years_as_total_professional_experience():
+    facts = build_synthesis_context(production()).split("CONFIRMED ACTION PLAN")[0]
+    assert "- Total professional experience: approximately 5 years" in facts
+    assert "Years of experience: 5" not in facts
+    assert "- Current role: AI Engineer at Branchy Solution" in facts
+
+
+def test_the_conversation_keeps_its_own_label():
+    """Only synthesis relabels. The conversation's KNOWN SO FAR is unchanged."""
+    assert "- Years of experience: 5" in render_known_data(production())
+
+
+def test_the_rules_forbid_attaching_total_years_to_a_role():
+    assert "Total professional experience is not tenure in any one role." in SYNTHESIS_RULES
+    assert "figure to a specific role, title, employer, or specialization" in SYNTHESIS_RULES
+
+
+@pytest.mark.parametrize("claim", [
+    PRODUCTION_SUMMARY,
+    "Five years as an AI Engineer.",
+    "Brings 5+ years' experience as an AI Engineer.",
+    "5 years of professional experience working as an AI Engineer.",
+    "A 5-year AI Engineer.",
+    "Has 5 years as a Generative AI Developer.",
+])
+def test_total_years_presented_as_role_tenure_are_rejected(claim):
+    """The production sentence, and its close variants, never reach the document."""
+    result, error = assemble_final_output(draft(positioning_summary=claim), production())
+    assert result is None
+    assert error is not None and "presented total experience as role tenure" in error
+
+
+@pytest.mark.parametrize("accurate", [
+    "About 5 years of professional experience, most recently as an AI Engineer.",
+    "An AI Engineer with about 5 years of total professional experience.",
+    "Five years of professional technical experience, now focused on AI engineering.",
+])
+def test_accurate_statements_of_total_experience_are_kept(accurate):
+    """The check is narrow: a false positive would discard a whole artifact."""
+    assert total_years_as_role_tenure(accurate, production()) is None
+    result, error = assemble_final_output(draft(positioning_summary=accurate), production())
+    assert error is None and result is not None
+    assert result.positioning_summary == accurate
+
+
+def test_the_check_reads_every_model_authored_field():
+    misattributed = draft(
+        positioning_summary="About 5 years of professional experience.",
+        risks_or_constraints=["5 years as an AI Engineer may read as senior"],
+    )
+    result, error = assemble_final_output(misattributed, production())
+    assert result is None
+    assert error is not None and "role tenure" in error
+
+
+def test_no_stored_years_means_nothing_to_misattribute():
+    assert total_years_as_role_tenure(PRODUCTION_SUMMARY, production(years_experience=None)) is None
+
+
+# --- Issue 2: every confirmed strength survives ----------------------------
+
+
+def test_the_model_does_not_author_strengths():
+    assert "strengths_to_leverage" not in FinalOutputDraft.model_fields
+    assert "strengths_to_leverage" not in FinalOutputDraft.model_json_schema()["properties"]
+
+
+def test_every_confirmed_strength_reaches_the_artifact_even_if_the_model_picked_four():
+    """Production: eight confirmed, four rendered. Whatever a draft carries, the
+    document lists all eight, verbatim and in confirmed order."""
+    picked_four = draft(strengths_to_leverage=[
+        "AI & Agent Engineering", "Backend & Web Development",
+        "Cross-functional collaboration", "Strong quality and reliability mindset",
+    ])
+    result, error = assemble_final_output(picked_four, production())
+
+    assert error is None and result is not None
+    assert result.strengths_to_leverage == PRODUCTION_STRENGTHS
+    markdown = render_final_output(result)
+    for strength in PRODUCTION_STRENGTHS:
+        assert f"- {strength}\n" in markdown
+    assert "- Data & Persistence\n" in markdown and "- DevOps & Testing\n" in markdown
+
+
+def test_no_confirmed_strengths_means_an_empty_list_not_an_invented_one():
+    result, _ = assemble_final_output(draft(), production(strengths=[]))
+    assert result is not None and result.strengths_to_leverage == []
+
+
+# --- Issue 3: "open to any industry" is a recorded preference ---------------
+
+
+def test_an_open_industry_answer_is_not_reported_unknown():
+    unknowns = derive_unknowns(production())
+    assert UNKNOWN_LABELS["target_industries"] not in unknowns
+    assert "Target industries were never discussed" not in unknowns
+
+
+def test_facts_state_the_industry_flexibility():
+    facts = build_synthesis_context(production()).split("CONFIRMED ACTION PLAN")[0]
+    assert f"- Target industries: {OPEN_TO_ANY_INDUSTRY}" in facts
+    assert '"Target industries: open to any industry" means the user has no preferred industry.' in SYNTHESIS_RULES
+
+
+def test_where_to_look_states_industry_flexibility_without_inventing_an_industry():
+    """Production's model listed locations and employment types and said nothing
+    about industry. The user's own answer is added; no sector is."""
+    silent = draft(search_targets=["GTA", "remote", "full-time", "contract"])
+    result, error = assemble_final_output(silent, production())
+
+    assert error is None and result is not None
+    assert result.search_targets == ["Open to any industry", "GTA", "remote", "full-time", "contract"]
+    markdown = render_final_output(result)
+    assert "- Open to any industry\n" in markdown
+    assert "Target industries were never discussed" not in markdown
+
+
+def test_flexibility_the_model_already_stated_is_not_repeated():
+    stated = draft(search_targets=["Any industry with substantial AI engineering work", "GTA"])
+    result, _ = assemble_final_output(stated, production())
+    assert result is not None
+    assert result.search_targets == ["Any industry with substantial AI engineering work", "GTA"]
+
+
+def test_named_industries_add_nothing():
+    result, _ = assemble_final_output(
+        draft(search_targets=["fintech"]), production(target_industries=["fintech"]),
+    )
+    assert result is not None and result.search_targets == ["fintech"]
+
+
+# --- All three, on the production profile ---------------------------------
+
+
+def test_the_production_profile_now_yields_a_grounded_plan():
+    compliant = draft(
+        positioning_summary=(
+            "About 5 years of professional technical experience, most recently as an AI "
+            "Engineer, focused on production LLM, RAG and agent systems."
+        ),
+        search_targets=["GTA", "remote"],
+    )
+    result, error = assemble_final_output(compliant, production())
+
+    assert error is None and result is not None
+    markdown = render_final_output(result)
+    assert "years of experience as an AI Engineer" not in markdown
+    assert "5 years as an AI Engineer" not in markdown
+    assert all(f"- {strength}\n" in markdown for strength in PRODUCTION_STRENGTHS)
+    assert "Target industries were never discussed" not in markdown
+    assert "- Open to any industry\n" in markdown

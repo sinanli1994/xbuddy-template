@@ -10,6 +10,9 @@ from that schema on purpose:
 
 * **`headline`** — derived from collected roles and explicit focus. A neutral
   career-plan title is safer than guessing that every goal is a career change.
+* **`strengths_to_leverage`** — every confirmed strength, verbatim, in confirmed
+  order. The document presents them as the user's strengths, so a selection would
+  silently contradict what they confirmed.
 * **`action_items`** — assembled by `assemble_final_output` from the confirmed
   Action Plan plus the model's annotations. The step text is never part of the
   model's output, so "preserved exactly" is a property of the type rather than a
@@ -36,6 +39,7 @@ rate before deciding whether one is worth paying for.
 """
 
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import SystemMessage
@@ -43,6 +47,7 @@ from langchain_core.messages import SystemMessage
 from .career_title import career_plan_title
 from .context import _FIELD_LABELS
 from .models import (
+    OPEN_TO_ANY_INDUSTRY,
     ActionItem,
     FinalOutput,
     FinalOutputDraft,
@@ -128,6 +133,13 @@ def _render_facts(user_data: XBuddyData) -> str:
         value = getattr(user_data, field_name, None)
         if _is_missing(value):
             continue
+        if field_name == "years_experience":
+            # The one stored figure is total professional experience. Under the bare
+            # label "Years of experience", beside "Current role: AI Engineer", a model
+            # wrote "5 years of experience as an AI Engineer" for someone with about a
+            # year in that role. Only here: the conversation's labels are unchanged.
+            lines.append(f"- Total professional experience: approximately {value} years")
+            continue
         label = _FIELD_LABELS.get(field_name, field_name.replace("_", " ").capitalize())
         if isinstance(value, list):
             lines.append(f"- {label}: {', '.join(str(entry) for entry in value)}")
@@ -186,6 +198,82 @@ def _synthesis_chain():
     )
 
 
+_NUMBER_WORDS = {
+    1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+    8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+    14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
+    19: "nineteen", 20: "twenty",
+}
+
+
+def _role_titles(user_data: XBuddyData) -> list[str]:
+    """Titles a total-years figure could be misattributed to: current and target roles.
+
+    "AI Engineer at Branchy Solution" contributes "AI Engineer" — the employer is not
+    part of the title a sentence would attach years to.
+    """
+    titles: list[str] = []
+    for role in [user_data.current_role, *user_data.target_roles]:
+        if not role or not role.strip():
+            continue
+        title = re.split(r"\s+(?:at|@)\s+", role.strip(), maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if title and title.casefold() not in {existing.casefold() for existing in titles}:
+            titles.append(title)
+    return titles
+
+
+def total_years_as_role_tenure(text: str, user_data: XBuddyData) -> str | None:
+    """The phrase presenting total experience as tenure in a stored role, or None.
+
+    Narrow on purpose. It catches the figure joined directly to a title — "5 years of
+    experience as an AI Engineer", "five years as a Senior SRE", "a 5-year AI Engineer"
+    — and nothing looser, because a false positive discards a whole artifact. "5 years
+    of professional experience, most recently as an AI Engineer" is accurate and is
+    not matched. SYNTHESIS_RULES is the primary defence; this is the backstop.
+    """
+    years = user_data.years_experience
+    if years is None:
+        return None
+    amounts = [str(years)] + ([_NUMBER_WORDS[years]] if years in _NUMBER_WORDS else [])
+    span = rf"(?:{'|'.join(re.escape(amount) for amount in amounts)})\+?[\s-]*(?:years?|yrs?)['’]?"
+    experience = r"(?:\s+of(?:\s+[\w-]+){0,3}\s+experience|\s+experience)?"
+    for title in _role_titles(user_data):
+        role = re.escape(title).replace(r"\ ", r"\s+")
+        for pattern in (
+            rf"\b{span}{experience}\s+(?:working\s+)?as\s+(?:an?\s+)?{role}\b",
+            rf"\b{span}\s+{role}\b",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(0)
+    return None
+
+
+def _model_authored_text(draft: FinalOutputDraft) -> list[str]:
+    """Every string in the draft the model wrote, which is everything in it."""
+    texts = [draft.positioning_summary, *draft.skill_priorities, *draft.search_targets,
+             *draft.risks_or_constraints]
+    for annotation in draft.action_annotations:
+        texts.append(annotation.rationale)
+        if annotation.timeframe:
+            texts.append(annotation.timeframe)
+    return texts
+
+
+def _search_targets(draft: FinalOutputDraft, user_data: XBuddyData) -> list[str]:
+    """The model's search targets, stating industry flexibility when the user gave it.
+
+    "Open to any industry" is the user's answer, not a recommendation, so it is not
+    left to the model to remember. Nothing is added when the model already said it.
+    """
+    targets = list(draft.search_targets)
+    if OPEN_TO_ANY_INDUSTRY in user_data.target_industries and not any(
+        "any industr" in target.casefold() for target in targets
+    ):
+        targets.insert(0, "Open to any industry")
+    return targets
+
+
 def assemble_final_output(
     draft: FinalOutputDraft, user_data: XBuddyData
 ) -> tuple[FinalOutput | None, str | None]:
@@ -204,6 +292,15 @@ def assemble_final_output(
     asked to annotate, and guessing which step lost its rationale would be inventing
     the very thing this function exists to protect.
     """
+    for text in _model_authored_text(draft):
+        misattributed = total_years_as_role_tenure(text, user_data)
+        if misattributed is not None:
+            # An inaccurate claim about the user's career, in their own document.
+            # Rejected like any other assembly disagreement; the next turn retries.
+            return None, (
+                f"synthesis presented total experience as role tenure: {misattributed!r}"
+            )
+
     confirmed = list(user_data.action_items)
     by_number = {annotation.step_number: annotation for annotation in draft.action_annotations}
 
@@ -240,9 +337,9 @@ def assemble_final_output(
         final_output = FinalOutput(
             headline=career_plan_title(user_data),
             positioning_summary=draft.positioning_summary,
-            strengths_to_leverage=draft.strengths_to_leverage,
+            strengths_to_leverage=list(user_data.strengths),  # every one, verbatim
             skill_priorities=draft.skill_priorities,
-            search_targets=draft.search_targets,
+            search_targets=_search_targets(draft, user_data),
             action_items=items,
             risks_or_constraints=draft.risks_or_constraints,
             unknowns=derive_unknowns(user_data),

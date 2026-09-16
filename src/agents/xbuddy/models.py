@@ -109,12 +109,25 @@ class BackgroundExtract(BaseModel):
     )
 
 
+# The stored value for an explicit "no industry preference". Job Preferences tells
+# the agent to record that answer rather than press for a sector, and a list field
+# holding nothing is indistinguishable from never having asked — so the answer has
+# to be a value. `extraction.merge_extraction` normalizes its spelling.
+OPEN_TO_ANY_INDUSTRY = "open to any industry"
+
+
 class JobPreferencesExtract(BaseModel):
     """Extraction schema for the Job Preferences section. See CareerGoalExtract."""
 
     preferred_locations: list[str] | None = Field(description="Cities, regions, or 'remote'.")
     preferred_work_modes: list[str] | None = Field(description="remote / hybrid / on-site.")
-    target_industries: list[str] | None = Field(description="Sectors they want to work in.")
+    target_industries: list[str] | None = Field(
+        description=(
+            "Sectors they want to work in. If the user says they have no industry "
+            f"preference or are open to any industry, return exactly [\"{OPEN_TO_ANY_INDUSTRY}\"]. "
+            "Never name a sector the user did not name."
+        )
+    )
     employment_types: list[str] | None = Field(
         description="full-time / part-time / contract / freelance / internship."
     )
@@ -317,7 +330,10 @@ class FinalOutput(BaseModel):
         )
     )
     strengths_to_leverage: list[str] = Field(
-        description="Strengths worth leading with, drawn from what the user reported."
+        description=(
+            "Every strength the user confirmed, verbatim and in confirmed order. Assembled "
+            "deterministically by synthesis.assemble_final_output — never a selection."
+        )
     )
     skill_priorities: list[str] = Field(
         description="Gaps to close, most limiting first. Empty list if none were identified."
@@ -426,11 +442,15 @@ class ActionAnnotation(BaseModel):
 class FinalOutputDraft(BaseModel):
     """What the synthesis model actually returns. Narrower than `FinalOutput`.
 
-    Three fields of the final artifact are missing on purpose, because none is the
+    Four fields of the final artifact are missing on purpose, because none is the
     model's to decide:
 
     * **`headline`** — derived from collected roles and explicit focus at assembly,
       so specializing in the same role is never described as changing professions.
+    * **`strengths_to_leverage`** — every confirmed strength, copied from
+      `XBuddyData.strengths` at assembly. Asked to "select and sharpen", the model
+      returned four of eight confirmed strengths under a heading that reads as the
+      user's own list; a strength the user confirmed is not the model's to drop.
     * **`action_items`** — assembled from the confirmed Action Plan plus these
       annotations, so step text and priority order are deterministic.
     * **`unknowns`** — derived from `XBuddyData` by `synthesis.derive_unknowns`. A
@@ -446,9 +466,6 @@ class FinalOutputDraft(BaseModel):
             "Two or three sentences on how this person should present themselves, "
             "built only from the FACTS block."
         )
-    )
-    strengths_to_leverage: list[str] = Field(
-        description="Strengths worth leading with, drawn from the FACTS block."
     )
     skill_priorities: list[str] = Field(
         description="Gaps to close, most limiting first. Empty list if none were collected."
