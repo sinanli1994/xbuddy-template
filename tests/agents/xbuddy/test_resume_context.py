@@ -205,7 +205,13 @@ def test_skill_assessment_shows_the_retrieved_passages():
     assert block.startswith(EVIDENCE_HEADER)
     assert "[1] [Projects] JobBuddy — deployed the backend to Fly.io" in block
     assert "[3] [Skills] Languages: Python, Go, SQL" in block
-    assert "Do not infer skills from job titles" in block
+    # Both variants forbid inferring from a title: the proposal before strengths are
+    # confirmed, the original block after.
+    assert "never infer one from the target role or a job title" in " ".join(block.split())
+    confirmed = XBuddyData(target_roles=["AI Engineer"], strengths=["Backend"])
+    assert "Do not infer skills from job titles" in render_resume_block(
+        SectionID.SKILL_ASSESSMENT, skill_context(confirmed), confirmed
+    )
 
 
 def test_a_summary_passage_can_never_appear():
@@ -554,3 +560,131 @@ async def test_advancing_off_a_done_section_reaches_skill_assessment_evidence(re
     assert "NO RESUME EVIDENCE FOR THIS SECTION" not in prompt
     assert merged["resume_context"].evidence_key is not None
     assert merged["resume_context"].evidence
+
+
+# --------------------------------------------------------------------------
+# Skill Assessment starts from resume evidence (production regression)
+# --------------------------------------------------------------------------
+#
+# Production: evidence was in the prompt when Skill Assessment opened, yet the reply
+# asked "What are you genuinely good at, and can you provide an example or evidence
+# for each strength?" — the section prompt's default — until the user said "please
+# start from the evidence in my resume".
+
+from agents.xbuddy.nodes.memory_updater import _extraction_window
+from agents.xbuddy.resume.context import (
+    EVIDENCE_BLOCK,
+)
+
+PROPOSAL_HEADING = "HOW TO USE THEM — NO STRENGTHS CONFIRMED YET"
+SECTION_DEFAULT = "Start with strengths and ask for an example alongside each one."
+
+
+def skill_block(data):
+    return render_resume_block(SectionID.SKILL_ASSESSMENT, skill_context(data), data)
+
+
+def flat(text):
+    return " ".join(text.split())
+
+
+def test_evidence_and_no_confirmed_strengths_asks_for_a_grounded_proposal():
+    """1. The reply is told to propose strengths from the evidence, not ask from scratch."""
+    block = skill_block(XBuddyData(target_roles=["AI Engineer"]))
+    assert block.startswith(EVIDENCE_HEADER)
+    assert PROPOSAL_HEADING in block
+    text = flat(block)
+    assert 'This replaces "start with strengths and ask for an example"' in text
+    assert "do not ask the user to describe their strengths from scratch" in text
+    assert "Propose a short numbered list of candidate strengths relevant to their target roles" in text
+    for passage in EVIDENCE:
+        assert passage.content in block, "the passages the proposal must draw on are shown"
+
+
+def test_each_proposed_strength_must_cite_the_evidence():
+    """2. Every candidate names the specific support it draws from the passages."""
+    text = flat(skill_block(XBuddyData(target_roles=["AI Engineer"])))
+    assert ("For each, name the strength and cite the specific project, technology, "
+            "responsibility or experience from the passages above that supports it") in text
+    assert "if the passages support fewer strengths, propose fewer" in text
+
+
+def test_the_user_is_asked_to_confirm_correct_remove_or_add():
+    """3. The proposal ends in one question that hands the decision to the user."""
+    text = flat(skill_block(XBuddyData(target_roles=["AI Engineer"])))
+    assert "invite the user to confirm, correct, remove, or add strengths" in text
+    assert "That is your one question." in text
+
+
+def test_unsupported_technology_inference_is_forbidden():
+    """4. Nothing absent from the passages, and nothing inferred from the role."""
+    text = flat(skill_block(XBuddyData(target_roles=["AI Engineer"])))
+    assert "Use only what the passages actually say." in text
+    assert "never infer one from the target role or a job title" in text
+    assert "not TensorFlow, PyTorch, a cloud platform, or anything else absent above" in text
+
+
+@pytest.mark.asyncio
+async def test_no_evidence_keeps_the_ask_the_user_behaviour(resume_backend):
+    """5. Without evidence, nothing about strengths changes."""
+    data = XBuddyData(target_roles=["AI Engineer"])
+    # No resume on file: no block at all, so the section default is what the reply follows.
+    resume_backend.status = None
+    update, _ = await route(graph_state(SectionID.SKILL_ASSESSMENT, user_data=data))
+    prompt = update["context_packet"].system_prompt
+    assert SECTION_DEFAULT in prompt
+    assert PROPOSAL_HEADING not in prompt and EVIDENCE_HEADER not in prompt
+    # A resume, but no usable evidence for this query: the guard, never the proposal.
+    stale = render_resume_block(SectionID.SKILL_ASSESSMENT, skill_context(XBuddyData(target_roles=["Data Analyst"])), data)
+    assert stale == NO_RESUME_EVIDENCE_BLOCK and PROPOSAL_HEADING not in stale
+
+
+def test_confirmed_strengths_do_not_restart_the_assessment():
+    """6. Once strengths are confirmed, the evidence supports the rest of the section."""
+    data = XBuddyData(target_roles=["AI Engineer"], strengths=["Backend & Web Development"])
+    block = skill_block(data)
+    assert PROPOSAL_HEADING not in block
+    assert block == EVIDENCE_BLOCK.format(passages=block.split("\n", 3)[3].split("\n\nHOW TO USE THEM")[0])
+
+
+def test_resume_evidence_stays_unconfirmed_until_the_user_answers():
+    """7. A proposal is not consent: extraction never reads it before the user replies."""
+    text = flat(skill_block(XBuddyData(target_roles=["AI Engineer"])))
+    assert text.startswith("RESUME EVIDENCE — NOT USER-CONFIRMED")
+    assert "these are candidates drawn from their resume, awaiting their confirmation" in text
+    assert "Nothing here is recorded until the user answers." in text
+    proposal = AIMessage(content="1. Backend & Web Development — JobBuddy on Fly.io. Which are accurate?")
+    confirmed_prefs = HumanMessage(content="yes", id="h-prefs")
+    assert _extraction_window([confirmed_prefs, proposal]) == [confirmed_prefs], \
+        "the proposed strengths are outside the window extraction reads"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_is_unchanged_by_which_block_renders(resume_backend):
+    """8. Same query, same K, same cache key, with or without confirmed strengths."""
+    resume_backend.status, resume_backend.evidence = status(), EVIDENCE
+    roles = ["AI Engineer"]
+    before = await resolve(resume_backend, SectionID.SKILL_ASSESSMENT, messages=H1,
+                           data=XBuddyData(target_roles=roles))
+    after = await resolve(resume_backend, SectionID.SKILL_ASSESSMENT, messages=H1,
+                          data=XBuddyData(target_roles=roles, strengths=["Backend"]))
+    assert len(resume_backend.retrieve_calls) == 2
+    first, second = resume_backend.retrieve_calls
+    assert first == second, "query and K do not depend on confirmed strengths"
+    assert first[3] == SKILL_EVIDENCE_K == 3
+    assert before.context.evidence_key == after.context.evidence_key
+    assert before.context.evidence == after.context.evidence
+
+
+@pytest.mark.asyncio
+async def test_entering_skill_assessment_with_evidence_prompts_the_proposal(resume_backend):
+    """The production shape end to end through the router: evidence retrieved, no
+    strengths yet, and the reply's prompt carries the proposal, overriding the default."""
+    resume_backend.status, resume_backend.evidence = status(), EVIDENCE
+    data = XBuddyData(target_roles=["AI Engineer", "Generative AI Developer", "AI Solutions Engineer"])
+    update, merged = await route(graph_state(SectionID.SKILL_ASSESSMENT, user_data=data))
+    prompt = update["context_packet"].system_prompt
+    assert EVIDENCE_HEADER in prompt and PROPOSAL_HEADING in prompt
+    # The section default is still in the template; the block after it overrides it.
+    assert prompt.index(SECTION_DEFAULT) < prompt.index(PROPOSAL_HEADING)
+    assert merged["resume_context"].evidence and merged["user_data"].strengths == []

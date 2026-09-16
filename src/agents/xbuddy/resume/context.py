@@ -75,6 +75,33 @@ HOW TO USE THEM
   add anything the passages do not contain. Ignore a passage that is not relevant.
 - A skill is recorded only when the user says so. Their self-assessment decides."""
 
+# The same evidence, before any strength is confirmed. The section prompt says to
+# start by asking the user for strengths and examples; with a resume on file that
+# asks them to retype what retrieval already found. In production the user had to
+# say "please start from the evidence in my resume" before the passages were used.
+STRENGTHS_PROPOSAL_BLOCK = """RESUME EVIDENCE — NOT USER-CONFIRMED
+Passages retrieved from the user's resume as possible evidence for this section.
+They show what the resume says, not what the user claims about themselves.
+{passages}
+
+HOW TO USE THEM — NO STRENGTHS CONFIRMED YET
+This replaces "start with strengths and ask for an example": do not ask the user
+to describe their strengths from scratch. Start from this evidence instead.
+- Propose a short numbered list of candidate strengths relevant to their target
+  roles, usually three to five. For each, name the strength and cite the specific
+  project, technology, responsibility or experience from the passages above that
+  supports it.
+- Say plainly that these are candidates drawn from their resume, awaiting their
+  confirmation — not conclusions.
+- Use only what the passages actually say. Never add a technology, tool, platform
+  or skill the passages do not contain, and never infer one from the target role
+  or a job title — not TensorFlow, PyTorch, a cloud platform, or anything else
+  absent above. Ignore a passage that is not relevant; if the passages support
+  fewer strengths, propose fewer.
+- End by asking which of these are accurate, and invite the user to confirm,
+  correct, remove, or add strengths. That is your one question.
+- Nothing here is recorded until the user answers. Their answer decides."""
+
 NO_RESUME_EVIDENCE_BLOCK = """NO RESUME EVIDENCE FOR THIS SECTION
 The user has a resume on file, but nothing from it is available for this part of
 the conversation.
@@ -284,6 +311,10 @@ def render_resume_block(
         if not passages:
             return NO_RESUME_EVIDENCE_BLOCK
         rendered = "\n".join(f"[{n}] {e.content.strip()}" for n, e in enumerate(passages, start=1))
-        return EVIDENCE_BLOCK.format(passages=rendered)
+        # Rendering only: which evidence was retrieved, and when, is unchanged.
+        # Before any strength is confirmed, propose from the evidence; after, the
+        # evidence supports the rest of the section without restarting it.
+        template = EVIDENCE_BLOCK if user_data.strengths else STRENGTHS_PROPOSAL_BLOCK
+        return template.format(passages=rendered)
 
     return NO_RESUME_EVIDENCE_BLOCK
