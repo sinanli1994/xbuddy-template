@@ -12,6 +12,7 @@
     "check:conversations": "npx tsx scripts/conversation-probe.ts",
     "check:scroll": "npx tsx scripts/chat-scroll-probe.ts",
     "check:layout": "npx tsx scripts/sidebar-layout-probe.tsx",
+    "check:mobile": "npx tsx scripts/mobile-layout-probe.tsx",
     "check:reveal": "npx tsx scripts/text-reveal-probe.ts",
     "check:streaming": "node scripts/streaming-probe.mjs",
     "check:sse-split": "node scripts/sse-split-probe.mjs",

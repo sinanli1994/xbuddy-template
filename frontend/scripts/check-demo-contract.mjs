@@ -1278,6 +1278,36 @@ check(
   !re('disabled=\\{[^}]*resume').test(chatResume)
 );
 
+// ------------------------------------------------------- responsive layout ----
+//
+// Structure and CSS rules are measured by mobile-layout-probe.tsx. These pin the
+// wiring: one drawer state, one sidebar, and the ways out of an open drawer.
+
+check(
+  'one drawer state owns the mobile sidebar',
+  page8.includes('const [menuOpen, setMenuOpen] = useState(false);') &&
+    count(page8, /<aside/g) === 1,
+  'the drawer is the sidebar itself, never a second copy of its state or components'
+);
+check(
+  'Escape closes the drawer and focus returns to what opened it',
+  re("if \\(!menuOpen\\) return;[^]{0,400}event\\.key === 'Escape'[^]{0,300}focusBeforeMenu\\.current\\?\\.focus\\(\\)").test(page8)
+);
+check(
+  'the backdrop closes the drawer',
+  re('className="jb-backdrop"[^]{0,200}onClick=\\{closeMenu\\}').test(page8)
+);
+check(
+  'starting or choosing a conversation closes the drawer',
+  re('const handleNewConversation[^]{0,700}setMenuOpen\\(false\\)').test(page8) &&
+    re('const handleSelectConversation[^]{0,200}setMenuOpen\\(false\\)').test(page8)
+);
+check(
+  'the chat header menu button opens the drawer',
+  chatResume.includes('className="jb-menu-button"') && chatResume.includes('onClick={onOpenMenu}') &&
+    page8.includes('onOpenMenu={openMenu}')
+);
+
 // ----------------------------------------------------------------- report ----
 
 const failed = results.filter((r) => !r.ok);
