@@ -452,3 +452,117 @@ async def test_initialize_then_router_through_compiled_graph(monkeypatch, make_d
     ]
     # One human + one AI reply: neither node duplicated the history.
     assert len(values["messages"]) == 2
+
+
+# --------------------------------------------------------------------------
+# A finished section must not trap the conversation (production regression)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_done_section_advances_even_when_the_directive_says_stay():
+    """The exact production failure, reproduced.
+
+    The decision model confirmed Job Preferences (`is_satisfied` true) but emitted
+    `stay`; memory_updater marked the section DONE. The router kept it current, so
+    Skill Assessment never opened and its resume retrieval never ran.
+    """
+    state = cold_state(
+        current_section=SectionID.JOB_PREFERENCES,
+        router_directive=RouterDirective.STAY,
+        section_states=sections_with(
+            career_goal=SectionStatus.DONE,
+            background=SectionStatus.DONE,
+            job_preferences=SectionStatus.DONE,
+        ),
+        messages=[HumanMessage(content="Please start from my resume")],
+    )
+    update = await router_node(state, {})
+    assert update["current_section"] is SectionID.SKILL_ASSESSMENT
+    assert update["section_states"]["skill_assessment"].status is SectionStatus.IN_PROGRESS
+    assert update["context_packet"].section_id is SectionID.SKILL_ASSESSMENT
+
+
+@pytest.mark.asyncio
+async def test_the_advanced_turn_still_answers_the_pending_message():
+    """Advancing is only useful if the turn then replies in the new section."""
+    state = cold_state(
+        current_section=SectionID.JOB_PREFERENCES,
+        router_directive=RouterDirective.STAY,
+        section_states=sections_with(
+            career_goal=SectionStatus.DONE,
+            background=SectionStatus.DONE,
+            job_preferences=SectionStatus.DONE,
+        ),
+        messages=[HumanMessage(content="Please start from my resume")],
+    )
+    update = await router_node(state, {})
+    assert route_decision({**state, **update}) == "generate_reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [SectionStatus.PENDING, SectionStatus.IN_PROGRESS])
+async def test_stay_holds_while_the_section_is_unfinished(status):
+    """Legitimate stay is untouched: only a DONE section advances."""
+    state = cold_state(
+        current_section=SectionID.JOB_PREFERENCES,
+        router_directive=RouterDirective.STAY,
+        section_states=sections_with(
+            career_goal=SectionStatus.DONE, background=SectionStatus.DONE, job_preferences=status
+        ),
+    )
+    update = await router_node(state, {})
+    assert update["current_section"] is SectionID.JOB_PREFERENCES
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_directive_on_a_done_section_advances_and_normalizes():
+    """A malformed directive normalizes to stay, so it must not trap a finished
+    section either — and the directive still has to be rewritten, or route_decision
+    dead-ends on it."""
+    state = cold_state(
+        current_section=SectionID.JOB_PREFERENCES,
+        router_directive="garbage",
+        section_states=sections_with(
+            career_goal=SectionStatus.DONE,
+            background=SectionStatus.DONE,
+            job_preferences=SectionStatus.DONE,
+        ),
+        messages=[HumanMessage(content="anything")],
+    )
+    update = await router_node(state, {})
+    assert update["current_section"] is SectionID.SKILL_ASSESSMENT
+    assert update["router_directive"] is RouterDirective.STAY
+    assert route_decision({**state, **update}) == "generate_reply"
+
+
+@pytest.mark.asyncio
+async def test_stay_with_every_section_done_holds_position():
+    """The final-output path is unchanged: nothing left to advance to."""
+    state = cold_state(
+        current_section=SectionID.ACTION_PLAN,
+        router_directive=RouterDirective.STAY,
+        section_states=all_done(),
+    )
+    update = await router_node(state, {})
+    assert update["current_section"] is SectionID.ACTION_PLAN
+
+
+@pytest.mark.asyncio
+async def test_modify_still_revisits_a_finished_section():
+    """Deliberate navigation is preserved: `modify` outranks the DONE rule, so a
+    user can still reopen a section they already completed."""
+    state = cold_state(
+        current_section=SectionID.SKILL_ASSESSMENT,
+        router_directive="modify:background",
+        section_states=sections_with(
+            career_goal=SectionStatus.DONE,
+            background=SectionStatus.DONE,
+            job_preferences=SectionStatus.DONE,
+        ),
+    )
+    update = await router_node(state, {})
+    merged = {**state, **update}
+    assert update["current_section"] is SectionID.BACKGROUND
+    # The router never downgrades DONE, and emits section_states only when they change.
+    assert merged["section_states"]["background"].status is SectionStatus.DONE
