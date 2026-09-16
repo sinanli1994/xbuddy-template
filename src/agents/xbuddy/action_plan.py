@@ -77,6 +77,24 @@ def render_proposal(draft: ActionPlanDraft, data: XBuddyData) -> str:
     return "\n".join(lines)
 
 
+REVISED_PLAN_QUESTION = (
+    "Does this revised action plan look right? "
+    "If so, confirm it and I'll use it in your final career plan."
+)
+
+
+def render_revised_plan(steps: list[str]) -> str:
+    """The user's revised plan, shown back verbatim for one explicit confirmation.
+
+    Deterministic, like the proposal: a model asked to restate the plan could
+    reword the very steps the user is about to confirm.
+    """
+    lines = ["### Revised Action Plan", ""]
+    lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
+    lines.extend(["", REVISED_PLAN_QUESTION])
+    return "\n".join(lines)
+
+
 async def propose_first_draft(packet: ContextPacket, data: XBuddyData, config) -> tuple[str, list[str]]:
     # Actual Section 5 template and all collected state, not a Skills transition overlay.
     message = SystemMessage(content=(

@@ -21,7 +21,7 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from ..action_plan import propose_first_draft
+from ..action_plan import propose_first_draft, render_revised_plan
 from ..enums import SectionID
 from ..models import ContextPacket, PendingActionPlan, XBuddyData, XBuddyState
 from ..sections.base_prompt import SATISFACTION_OVERLAY
@@ -51,6 +51,25 @@ def _reply_model():
     from core.llm import get_model
 
     return get_model()
+
+
+def _unpresented_revision(state: XBuddyState, packet: ContextPacket) -> PendingActionPlan | None:
+    """A pending Action Plan the user has not been shown, or None.
+
+    memory_updater stores a revised plan under a fresh id before any reply exists.
+    A plan whose id is not yet on a message is therefore one this reply must show.
+    A first-draft proposal never matches: it is created together with its message.
+    """
+    pending = state.get("pending_action_plan")
+    if packet.section_id is not SectionID.ACTION_PLAN or pending is None:
+        return None
+    try:
+        pending = PendingActionPlan.model_validate(pending)
+    except ValueError:
+        return None
+    if any(getattr(message, "id", None) == pending.message_id for message in state.get("messages", [])):
+        return None
+    return pending
 
 
 def _build_messages(
@@ -122,6 +141,21 @@ async def generate_reply_node(state: XBuddyState, config: RunnableConfig) -> XBu
                 "error_count": state.get("error_count", 0) + 1,
             }
         return proposal_update  # type: ignore[return-value]
+
+    revision = _unpresented_revision(state, packet)
+    if revision is not None:
+        # The plan the user just revised, shown back for one explicit confirmation.
+        # Its message carries the pending plan's id, so only an answer to this exact
+        # message can confirm it — not the earlier proposal, and not a later turn.
+        revision_update: dict[str, Any] = {
+            "messages": [AIMessage(
+                content=render_revised_plan(revision.action_items), id=revision.message_id,
+            )],
+            "short_memory": window,
+            "awaiting_user_input": True,
+            "awaiting_satisfaction_feedback": True,
+        }
+        return revision_update  # type: ignore[return-value]
 
     try:
         response = await _reply_model().ainvoke(messages, config)
