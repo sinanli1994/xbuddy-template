@@ -4,11 +4,16 @@ import React, { useRef } from 'react';
 import { currentResume, type ResumeView } from '@/utils/resume';
 
 /**
- * The resume attached to the selected conversation.
+ * The resume attached to the selected conversation, as a compact status.
  *
- * Presentational only: the page owns the state and the requests. What it renders
- * comes from the backend's status — this card never claims a resume the backend
- * did not report as indexed.
+ * The welcome card is where a resume is first added; this is where it stays visible
+ * and manageable after the conversation starts — status, Replace, and recovery from
+ * a failed upload or status check. Before anything is attached it is deliberately
+ * quiet, so it never competes with the welcome card's upload.
+ *
+ * Presentational only: the page owns the state and the requests, and the welcome
+ * card renders the same view. What it shows comes from the backend's status — it
+ * never claims a resume the backend did not report as indexed.
  */
 
 interface Props {
@@ -18,7 +23,7 @@ interface Props {
 }
 
 const buttonStyle: React.CSSProperties = {
-  padding: '6px 10px',
+  padding: '5px 10px',
   fontSize: 12,
   fontWeight: 600,
   color: '#4f46e5',
@@ -26,12 +31,25 @@ const buttonStyle: React.CSSProperties = {
   border: '1px solid #c7d2fe',
   borderRadius: 6,
   cursor: 'pointer',
+  flexShrink: 0,
+};
+
+const linkStyle: React.CSSProperties = {
+  padding: 0,
+  fontSize: 12,
+  fontWeight: 600,
+  color: '#4f46e5',
+  background: 'none',
+  border: 'none',
+  cursor: 'pointer',
 };
 
 export default function ResumeCard({ view, onUpload, onRetryStatus }: Props) {
   const input = useRef<HTMLInputElement>(null);
   const pick = () => input.current?.click();
   const inEffect = currentResume(view);
+  // Nothing attached yet: a plain line, not a card, so it reads as status.
+  const quiet = view.kind === 'none' || view.kind === 'checking';
 
   return (
     <div
@@ -39,10 +57,10 @@ export default function ResumeCard({ view, onUpload, onRetryStatus }: Props) {
       data-state={view.kind}
       style={{
         flexShrink: 0,
-        padding: '10px 12px',
+        padding: quiet ? '0 8px' : '10px 12px',
         borderRadius: 8,
-        backgroundColor: '#ffffff',
-        border: '1px solid #e2e8f0',
+        backgroundColor: quiet ? 'transparent' : '#ffffff',
+        border: quiet ? 'none' : '1px solid #e2e8f0',
         fontSize: 13,
         color: '#334155',
       }}
@@ -61,23 +79,20 @@ export default function ResumeCard({ view, onUpload, onRetryStatus }: Props) {
       />
 
       {view.kind === 'checking' && (
-        <div style={{ color: '#94a3b8' }}>Checking for a resume…</div>
+        <div style={{ fontSize: 12, color: '#94a3b8' }}>Checking for a resume…</div>
       )}
 
       {view.kind === 'none' && (
-        <>
-          <div style={{ marginBottom: 8, color: '#64748b', lineHeight: 1.4 }}>
-            Add your resume (PDF, up to 2 MB). JobBuddy uses it in Background and Skill
-            Assessment, and records nothing from it until you confirm.
-          </div>
-          <button onClick={pick} style={buttonStyle}>
-            Upload PDF
+        <div style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.5 }}>
+          No resume attached to this conversation.{' '}
+          <button type="button" onClick={pick} style={linkStyle}>
+            Add a PDF
           </button>
-        </>
+        </div>
       )}
 
       {view.kind === 'uploading' && (
-        <div aria-live="polite" style={{ color: '#64748b' }}>
+        <div aria-live="polite" style={{ color: '#64748b', overflowWrap: 'anywhere' }}>
           Reading {view.filename}…
         </div>
       )}
@@ -94,8 +109,9 @@ export default function ResumeCard({ view, onUpload, onRetryStatus }: Props) {
             <div style={{ fontSize: 12, color: '#64748b' }}>
               {view.meta.chunkCount} passages · {view.meta.pageCount} {view.meta.pageCount === 1 ? 'page' : 'pages'}
             </div>
+            <div style={{ fontSize: 11, color: '#94a3b8' }}>Attached to this conversation</div>
           </div>
-          <button onClick={pick} style={buttonStyle}>
+          <button type="button" onClick={pick} style={buttonStyle}>
             Replace
           </button>
         </div>
@@ -109,7 +125,7 @@ export default function ResumeCard({ view, onUpload, onRetryStatus }: Props) {
               Still using {inEffect.filename}.
             </div>
           )}
-          <button onClick={view.retry === 'status' ? onRetryStatus : pick} style={buttonStyle}>
+          <button type="button" onClick={view.retry === 'status' ? onRetryStatus : pick} style={buttonStyle}>
             {view.retry === 'status' ? 'Retry' : 'Choose another PDF'}
           </button>
         </div>

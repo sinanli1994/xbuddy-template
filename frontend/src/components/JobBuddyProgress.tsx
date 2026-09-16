@@ -264,10 +264,11 @@ export default function JobBuddyProgress({
         </div>
       </div>
 
-      {/* 2b. Resume — belongs to this conversation, so it sits with its progress. */}
+      {/* 2b. Resume — belongs to this conversation, so it sits with its progress. The
+          welcome card is where one is first added; this is its persistent status. */}
       {resume && (
         <div style={{ flexShrink: 0 }}>
-          <SectionHeading>Your Resume</SectionHeading>
+          <SectionHeading>Resume</SectionHeading>
           <ResumeCard view={resume} onUpload={onUploadResume} onRetryStatus={onRetryResumeStatus} />
         </div>
       )}

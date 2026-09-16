@@ -60,6 +60,7 @@ const CLIENT_FILES = [
   'src/components/JobBuddyWelcome.tsx',
   'src/components/FinalPlanPanel.tsx',
   'src/components/ResumeCard.tsx',
+  'src/components/ResumeDropZone.tsx',
   'src/utils/resume.ts',
 ];
 const DEMO_PATH = [...SERVER_ROUTES, ...SERVER_LIB, ...CLIENT_FILES];
@@ -1230,6 +1231,51 @@ check(
 check(
   'no resume data is stored in the browser',
   !re('localStorage[^\\n]*resume|resume[^\\n]*localStorage').test(page8)
+);
+
+// ------------------------------------------- welcome-card resume onboarding ----
+//
+// The welcome card is the primary upload surface and the sidebar its persistent
+// status. Rendering and drag/drop rules are measured by welcome-resume-probe.tsx;
+// these pin the wiring that keeps the two surfaces one state.
+
+const dropZone = code('src/components/ResumeDropZone.tsx');
+const chatResume = code('src/components/ChatArea.tsx');
+const count = (text, pattern) => (text.match(pattern) ?? []).length;
+
+check(
+  'the welcome card offers the resume upload through handlers it is given',
+  welcomeCode.includes('<ResumeDropZone') &&
+    re('<JobBuddyWelcome[^]{0,300}onUploadResume=\\{onUploadResume\\}').test(chatResume)
+);
+check(
+  'the welcome card and the sidebar receive the same resume view and upload handler',
+  count(page8, /resume=\{resumeForThread\(resume, identity\?\.threadId \?\? null\)\}/g) === 2 &&
+    count(page8, /onUploadResume=\{\(file\) => void handleUploadResume\(file\)\}/g) === 2,
+  'one resume state, two surfaces — never a second copy that can drift'
+);
+check(
+  'the drop zone makes no request and stores nothing',
+  !re('fetch[(]|/api/|supabase|localStorage|sessionStorage|JOBBUDDY_API_TOKEN').test(dropZone)
+);
+check(
+  'the drop zone claims indexed only from the view it is given',
+  dropZone.includes("view.kind === 'indexed'") && !re("kind: 'indexed'").test(dropZone)
+);
+check(
+  'every drag event on the drop zone cancels the browser default',
+  ['onDragEnter', 'onDragOver', 'onDrop'].every((name) =>
+    re(`${name}\\(event: DragEventLike\\) \\{\\s*event\\.preventDefault\\(\\);`).test(dropZone)
+  ),
+  'otherwise a dropped PDF opens in the tab instead of uploading'
+);
+check(
+  'a file refused before upload lands in the shared resume state',
+  re('const handleRejectResume[^]{0,600}updateResume\\(identity\\.threadId').test(page8)
+);
+check(
+  'a resume upload never disables the chat input',
+  !re('disabled=\\{[^}]*resume').test(chatResume)
 );
 
 // ----------------------------------------------------------------- report ----

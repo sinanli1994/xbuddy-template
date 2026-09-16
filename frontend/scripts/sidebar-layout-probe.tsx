@@ -113,11 +113,13 @@ function assertResumePlacement(html: string) {
 check('no conversation selected renders no resume card', () => {
   assert(!renderResume(null).includes('resume-card'));
 });
-check('no resume offers an upload', () => {
+check('no resume is a quiet status line that does not compete with the welcome upload', () => {
   const html = renderResume({ kind: 'none' });
   assertResumePlacement(html);
-  assert(html.includes('data-state="none"') && html.includes('>Upload PDF</button>'));
-  assert(html.includes('accept="application/pdf,.pdf"'));
+  assert(html.includes('data-state="none"') && html.includes('No resume attached to this conversation.'));
+  assert(html.includes('>Add a PDF</button>') && html.includes('accept="application/pdf,.pdf"'));
+  // The welcome card owns the prominent upload; the sidebar offers no rival to it.
+  assert(!html.includes('Upload Resume') && !html.includes('Drag &amp; drop') && !html.includes('resume-drop-zone'));
   assert(!html.includes('✓'));
 });
 check('checking shows no upload and no claim', () => {
@@ -133,6 +135,8 @@ check('indexed shows the filename, passage count, and Replace', () => {
   assertResumePlacement(html);
   assert(html.includes('✓ Jordan Avery CV.pdf') && html.includes('12 passages · 2 pages'));
   assert(html.includes('>Replace</button>'));
+  assert(html.includes('Attached to this conversation'), 'never implies an account-wide resume');
+  assert(html.includes('>Resume</h2>'));
 });
 check('an upload error keeps the previous resume visible as still in use', () => {
   const html = renderResume({ kind: 'error', message: 'That PDF is password-protected.', retry: 'upload', previous: meta });

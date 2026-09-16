@@ -346,6 +346,17 @@ export default function JobBuddyDemo() {
     }
   };
 
+  /**
+   * A file refused before any request — wrong type, too large, several at once. It
+   * goes into the same resume state as a failed upload, so the welcome card and the
+   * sidebar report it identically, and the resume already in effect stays in effect.
+   */
+  const handleRejectResume = (message: string) => {
+    if (!identity) return;
+    const previous = currentResume(resumeForThread(resume, identity.threadId));
+    updateResume(identity.threadId, { kind: 'error', message, retry: 'upload', previous });
+  };
+
   const handleFirstUserMessage = useCallback((content: string) => {
     if (!identity) return;
     // Metadata only: the transcript remains exclusively in the backend checkpoint.
@@ -496,6 +507,12 @@ export default function JobBuddyDemo() {
               if (selectionAtRender === selectionVersion.current) setCurrentSection(next);
             }}
             onFirstUserMessage={handleFirstUserMessage}
+            // The same view and handlers the sidebar receives: one resume state, two
+            // surfaces, so the welcome card and the sidebar cannot disagree.
+            resume={resumeForThread(resume, identity?.threadId ?? null)}
+            onUploadResume={(file) => void handleUploadResume(file)}
+            onRejectResume={handleRejectResume}
+            onRetryResumeStatus={() => identity && void loadResumeStatus(identity)}
             onCompletionUpdate={(next) => {
               if (selectionAtRender !== selectionVersion.current) return;
               setCompletion(next);

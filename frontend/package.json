@@ -17,6 +17,7 @@
     "check:sse-split": "node scripts/sse-split-probe.mjs",
     "check:parity": "npx tsx scripts/stream-parity-probe.ts",
     "check:resume": "npx tsx scripts/resume-probe.ts",
+    "check:welcome-resume": "npx tsx scripts/welcome-resume-probe.tsx",
     "check:resume-proxy": "node scripts/resume-proxy-probe.mjs"
   },
   "dependencies": {
