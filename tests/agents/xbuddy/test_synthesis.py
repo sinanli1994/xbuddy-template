@@ -686,10 +686,11 @@ def test_where_to_look_states_industry_flexibility_without_inventing_an_industry
 
 
 def test_flexibility_the_model_already_stated_is_not_repeated():
+    """Stated once, in the canonical wording, whatever the model wrote."""
     stated = draft(search_targets=["Any industry with substantial AI engineering work", "GTA"])
     result, _ = assemble_final_output(stated, production())
     assert result is not None
-    assert result.search_targets == ["Any industry with substantial AI engineering work", "GTA"]
+    assert result.search_targets == ["Open to any industry", "GTA"]
 
 
 def test_named_industries_add_nothing():
@@ -719,3 +720,104 @@ def test_the_production_profile_now_yields_a_grounded_plan():
     assert all(f"- {strength}\n" in markdown for strength in PRODUCTION_STRENGTHS)
     assert "Target industries were never discussed" not in markdown
     assert "- Open to any industry\n" in markdown
+
+
+# --------------------------------------------------------------------------
+# H. The unknowns and Where to Look agree with the rest of the document
+# --------------------------------------------------------------------------
+
+# Verbatim from the production plan that listed these as strengths and, beneath
+# them, "Current skills were never collected".
+CONFIRMED_STRENGTHS = [
+    "AI & Agent Engineering",
+    "Backend & Web Development",
+    "Data & Persistence",
+    "DevOps & Testing",
+    "Cross-Functional Collaboration, Testing, and a Strong Quality and Reliability Mindset",
+]
+
+
+def test_confirmed_strengths_answer_the_current_skills_question():
+    """1. Skill Assessment confirmed as strengths: skills are not reported missing."""
+    profile = production(strengths=CONFIRMED_STRENGTHS, current_skills=[])
+    assert UNKNOWN_LABELS["current_skills"] not in derive_unknowns(profile)
+
+    result, error = assemble_final_output(draft(), profile)
+    assert error is None and result is not None
+    assert UNKNOWN_LABELS["current_skills"] not in result.unknowns
+    assert "Current skills were never collected" not in render_final_output(result)
+
+
+def test_skills_genuinely_never_collected_are_still_reported():
+    """2. With neither strengths nor skills, both remain honest unknowns."""
+    unknowns = derive_unknowns(production(strengths=[], current_skills=[]))
+    assert UNKNOWN_LABELS["current_skills"] in unknowns
+    assert UNKNOWN_LABELS["strengths"] in unknowns
+
+
+def test_the_rule_runs_one_way_only():
+    """Skills do not answer the strengths question: that one is still asked for."""
+    unknowns = derive_unknowns(production(strengths=[], current_skills=["Python"]))
+    assert UNKNOWN_LABELS["strengths"] in unknowns
+    assert UNKNOWN_LABELS["current_skills"] not in unknowns
+
+
+@pytest.mark.parametrize("restated", [
+    "open across industries",
+    "Open to different industries",
+    "Any industry with meaningful AI engineering work",
+    "Industry-agnostic",
+    "No specific industry preference",
+    "Flexible across industries",
+    "Open to any industry",
+])
+def test_industry_flexibility_is_stated_exactly_once(restated):
+    """3. The canonical line plus any rewording of it renders one entry, canonical."""
+    result, error = assemble_final_output(draft(search_targets=["GTA", restated]), production())
+    assert error is None and result is not None
+    assert result.search_targets == ["Open to any industry", "GTA"]
+
+
+@pytest.mark.parametrize("named", [
+    "fintech",
+    "Healthcare and fintech industries",
+    "AI-first startups",
+    "Enterprise software companies",
+])
+def test_named_industries_survive_the_dedupe(named):
+    """4. Only restatements of flexibility are removed; a named industry never is."""
+    result, _ = assemble_final_output(draft(search_targets=[named, "open across industries"]), production())
+    assert result is not None
+    assert result.search_targets == ["Open to any industry", named]
+
+
+def test_a_user_who_named_industries_keeps_the_model_list_untouched():
+    targets = ["fintech", "open across industries"]
+    result, _ = assemble_final_output(
+        draft(search_targets=targets), production(target_industries=["fintech"]),
+    )
+    assert result is not None and result.search_targets == targets
+
+
+def test_the_production_final_plan_profile_renders_cleanly():
+    """5. The captured case: its real draft search_targets, its confirmed strengths."""
+    profile = production(
+        strengths=CONFIRMED_STRENGTHS,
+        current_skills=[],
+        skill_gaps=["Data Structures and Algorithms", "AI System Design",
+                    "Systematic Evaluation of LLM and RAG Systems"],
+    )
+    production_draft = draft(
+        positioning_summary="About 5 years of professional experience, currently an AI Engineer.",
+        search_targets=["GTA", "remote work", "full-time positions", "contract positions",
+                        "open across industries"],
+    )
+    result, error = assemble_final_output(production_draft, profile)
+
+    assert error is None and result is not None
+    markdown = render_final_output(result)
+    for strength in CONFIRMED_STRENGTHS:
+        assert f"- {strength}\n" in markdown
+    assert "Current skills were never collected" not in markdown
+    assert markdown.count("Open to any industry") == 1
+    assert "open across industries" not in markdown

@@ -102,6 +102,16 @@ def _is_missing(value: Any) -> bool:
     return value is None or value == [] or value == ""
 
 
+# A missing field whose question another populated field already answered. Skill
+# Assessment asks what the user can do; a user who confirms their capabilities as
+# strengths has answered it, even when extraction left `current_skills` empty. In
+# production that plan listed five confirmed strengths and, beneath them, "Current
+# skills were never collected" — a claim the document itself contradicted.
+_ANSWERED_BY: dict[str, tuple[str, ...]] = {
+    "current_skills": ("strengths",),
+}
+
+
 def derive_unknowns(user_data: XBuddyData) -> list[str]:
     """Which fields were never collected, as reader-facing lines.
 
@@ -109,12 +119,20 @@ def derive_unknowns(user_data: XBuddyData) -> list[str]:
     `XBuddyData.model_fields`, the same declaration order `render_known_data` uses,
     so the artifact's UNKNOWNS block matches the section order of the conversation.
 
-    A populated field never appears. An absent one always does.
+    A populated field never appears. An absent one appears unless a populated field
+    in `_ANSWERED_BY` already answered the same question. Nothing is invented: the
+    missing field stays missing, the document just stops claiming it was never asked.
     """
+    def answered(field_name: str) -> bool:
+        return any(
+            not _is_missing(getattr(user_data, other, None))
+            for other in _ANSWERED_BY.get(field_name, ())
+        )
+
     return [
         UNKNOWN_LABELS[field_name]
         for field_name in user_data.__class__.model_fields
-        if _is_missing(getattr(user_data, field_name, None))
+        if _is_missing(getattr(user_data, field_name, None)) and not answered(field_name)
     ]
 
 
@@ -260,18 +278,36 @@ def _model_authored_text(draft: FinalOutputDraft) -> list[str]:
     return texts
 
 
+# A search target that only restates "no industry preference", however worded. Each
+# alternative needs an explicit flexibility word right before "industr", so a line
+# naming sectors ("fintech and healthcare industries") never matches.
+_INDUSTRY_FLEXIBILITY = re.compile(
+    r"\b(?:any|all|every|different|various|multiple|many)\s+industr"
+    r"|\bacross\s+(?:(?:all|different|various|multiple|many)\s+)?industr"
+    r"|\bindustry[\s-]+(?:agnostic|flexible|neutral)\b"
+    r"|\bno\s+(?:specific\s+|particular\s+)?industry\s+preference"
+    r"|\bflexible\s+(?:on|about|across)\s+industr",
+    re.IGNORECASE,
+)
+_OPEN_TO_ANY_INDUSTRY_TARGET = "Open to any industry"
+
+
 def _search_targets(draft: FinalOutputDraft, user_data: XBuddyData) -> list[str]:
-    """The model's search targets, stating industry flexibility when the user gave it.
+    """The model's search targets, with industry flexibility stated exactly once.
 
     "Open to any industry" is the user's answer, not a recommendation, so it is not
-    left to the model to remember. Nothing is added when the model already said it.
+    left to the model to remember or to word. When the user gave it, every model
+    line that merely restates it is dropped and the canonical line leads, once. In
+    production the model wrote "open across industries" and the canonical line was
+    added beside it, so Where to Look said the same thing twice.
+
+    A user who named industries gets the model's list untouched.
     """
     targets = list(draft.search_targets)
-    if OPEN_TO_ANY_INDUSTRY in user_data.target_industries and not any(
-        "any industr" in target.casefold() for target in targets
-    ):
-        targets.insert(0, "Open to any industry")
-    return targets
+    if OPEN_TO_ANY_INDUSTRY not in user_data.target_industries:
+        return targets
+    kept = [target for target in targets if not _INDUSTRY_FLEXIBILITY.search(target)]
+    return [_OPEN_TO_ANY_INDUSTRY_TARGET, *kept]
 
 
 def assemble_final_output(
